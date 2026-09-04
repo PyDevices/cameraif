@@ -253,16 +253,21 @@ On an ESP32-P4 with an OV5647 at 800x800 RGB565:
 
 | | rate | what dominates |
 |---|---|---|
-| Sensor delivering frames | 35.5 fps | the format's own frame rate |
-| `frame()` — zero copy | 10 fps | invalidating 1.28 MB of cache |
-| `capture(buf)` — one copy | 7.6 fps | that, plus a 1.28 MB memcpy |
-| Preview on the 720x720 panel | 4.0 fps | 720 row blits per frame |
+| Sensor delivering frames | 36 fps | the format's own frame rate |
+| `frame()` — zero copy | 10.0 fps | invalidating 1.28 MB of cache |
+| `capture_jpeg(70)` | 8.0 fps | the same invalidate; the encoder is nearly free |
+| `capture(buf)` — one copy | 7.7 fps | that, plus a 1.28 MB memcpy |
+| Preview on the 720x720 panel | 4.7 fps | 720 row blits per frame |
 | MJPEG over Wi-Fi, quality 70 | 2.4 fps | the network |
 
 Nothing here is limited by JPEG encoding — the hardware encoder is not the
 bottleneck anywhere.
 
-The preview number is the one with room in it. Those 4 fps are 720 per-row
+Note where JPEG sits: encoding a whole frame costs less than copying one.
+`capture_jpeg()` is faster than `capture()` because the encoder reads the
+frame in place while a copy moves every byte through the CPU.
+
+The preview number is the one with room in it. Those 4.7 fps are 720 per-row
 blits, one for each line of the crop, because the sensor is 800 wide and the
 panel is 720 and nothing in between will move a rectangle out of a wider
 buffer. The P4 has a Pixel Processing Accelerator (`esp_driver_ppa`) that

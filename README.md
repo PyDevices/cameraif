@@ -109,6 +109,29 @@ With a buffer, fills it and returns the byte count — the zero-allocation form
 for a loop. With no buffer, returns a fresh `bytes`, for a one-shot still
 where making the caller size 1.28 MB first is a poor introduction.
 
+**`capture_scaled(dst, pic_w, pic_h, *, x=0, y=0, w=None, h=None, rotate=0, mirror=False, timeout=1000)`**
+
+Scale the frame into a rectangle of a destination picture, using the P4's
+Pixel Processing Accelerator. No pixel passes through the CPU: the PPA reads
+the camera buffer and writes the destination by DMA.
+
+```python
+fb = display_drv.framebuffers()[0]
+cam.capture_scaled(fb, display_drv.width, display_drv.height)
+display_drv.show()
+```
+
+The destination is described as a whole picture plus the block to write
+inside it, because that is exactly what a panel framebuffer is — so a
+preview hands this its scanout buffer and gets camera to glass in one
+hardware operation. `rotate` takes 0, 90, 180 or 270 and `mirror` flips in x,
+both free in the same pass. Returns the `(width, height)` written, or `None`
+if no frame arrived.
+
+`dst` must be cache-line aligned, since the PPA writes it by DMA — a panel
+framebuffer already is. A misaligned buffer raises rather than being quietly
+shifted, because the corruption would surface somewhere else entirely.
+
 **`capture_yuy2(buf, width, height, timeout=1000)`**
 
 Converts to YUY2 and scales to `width` x `height` while copying. This exists
@@ -254,27 +277,39 @@ On an ESP32-P4 with an OV5647 at 800x800 RGB565:
 | | rate | what dominates |
 |---|---|---|
 | Sensor delivering frames | 36 fps | the format's own frame rate |
-| `frame()` — zero copy | 10.0 fps | invalidating 1.28 MB of cache |
-| `capture_jpeg(70)` | 8.0 fps | the same invalidate; the encoder is nearly free |
-| `capture(buf)` — one copy | 7.7 fps | that, plus a 1.28 MB memcpy |
-| Preview on the 720x720 panel | 4.7 fps | 720 row blits per frame |
-| MJPEG over Wi-Fi, quality 70 | 2.4 fps | the network |
+| `capture_jpeg(70)` | 36 fps | nothing — it keeps up with the sensor |
+| `frame()` — zero copy | 35 fps | waiting for the next frame |
+| `capture_scaled()` to the panel | 34 fps | the PPA, ~1 ms |
+| Full preview loop, incl. `show()` | 18.6 fps | the panel's refresh, 24 ms |
+| MJPEG over Wi-Fi, quality 40 | 15 fps | the network |
+| MJPEG over Wi-Fi, quality 70 | 7 fps | the network |
 
-Nothing here is limited by JPEG encoding — the hardware encoder is not the
-bottleneck anywhere.
+Everything except the panel refresh now runs at the rate the sensor
+delivers. Two things got it there.
 
-Note where JPEG sits: encoding a whole frame costs less than copying one.
-`capture_jpeg()` is faster than `capture()` because the encoder reads the
-frame in place while a copy moves every byte through the CPU.
+**The PPA does the scaling.** `capture_scaled()` hands the frame to the
+Pixel Processing Accelerator, which reads the camera buffer and writes the
+panel's scanout buffer by DMA. The row-at-a-time version it replaced was 720
+blit calls per frame and ran at 4.7 fps.
 
-The preview number is the one with room in it. Those 4.7 fps are 720 per-row
-blits, one for each line of the crop, because the sensor is 800 wide and the
-panel is 720 and nothing in between will move a rectangle out of a wider
-buffer. The P4 has a Pixel Processing Accelerator (`esp_driver_ppa`) that
-scales, rotates and blits RGB565 in hardware and would replace the whole
-loop with one call. It is not wired up here — the firmware this was proven
-on had 22 KB left in its app partition, and that is a decision about what a
-board carries rather than one to make quietly inside a camera driver.
+**And a 97 ms wait that should not have existed.** Every capture was calling
+`esp_cam_ctlr_receive()` to hand the driver a buffer. But `esp_cam_ctlr_csi`
+reads its transaction queue only in the `else` branch of `if
+(ctlr->cbs.on_get_new_trans)` — and this module must register that callback,
+because it is how the driver is told which of the two buffers Python is not
+holding. So the queue was filled once and never drained again, and every
+subsequent `receive()` blocked for its whole timeout. The camera was
+delivering a frame every 28 ms and this module was collecting one every
+130 ms.
+
+It presented as a slow camera, which is the most expensive kind of bug to
+have: everything worked, so there was nothing to debug. It was found by
+measuring the parts separately instead of trusting a guess about which part
+was slow — the first guess, that the cache invalidate dominated, was wrong
+by a factor of fourteen.
+
+`capture_jpeg()` matching the sensor rate is not a rounding artefact: the
+hardware encoder genuinely costs less than the 28 ms between frames.
 
 ## Known hardware defect
 

@@ -5,19 +5,15 @@ other, with nothing in between but the board -- no PC, no network, no USB.
 
     mpremote run camera_preview.py
 
-**Why it crops instead of scaling.** The sensor gives 800x800 and this panel
-is 720x720. Scaling needs a resampler, and in Python that means arithmetic on
-every one of half a million pixels -- which measured 0.8 fps, an order of
-magnitude below the sensor. Cropping needs no arithmetic at all: each output
-row is a slice of an input row. It costs the outer 5% of the picture and buys
-a preview you can actually watch.
+**Nothing here touches a pixel.** `capture_scaled()` hands the frame to the
+P4's Pixel Processing Accelerator, which reads the camera's buffer and writes
+the panel's scanout buffer by DMA, scaling on the way. The CPU issues one
+call per frame and then waits. The whole 800x800 sensor image lands on the
+720x720 panel -- scaled, not cropped, so nothing at the edges is lost.
 
-**Why ``frame()`` and not ``capture()``.** ``capture()`` copies the frame into
-a buffer you own, which for 1.28 MB is about 100 ms of pure memory traffic.
-``frame()`` hands back a memoryview of the buffer the DMA just finished with,
-so a preview reads the pixels where they landed. The borrow is real: that view
-is only yours until the next ``frame()`` call, which gives the buffer back to
-the driver.
+For contrast, the obvious version of this loop -- slice each row out of the
+frame and blit it -- is 720 calls per frame and measured 4.7 fps. This is
+18.6, and the remaining cost is the panel's own refresh, not the camera.
 """
 
 import time
@@ -28,35 +24,27 @@ from board_config import display_drv as display
 
 def main():
     cam = board_config.camera
-    cam_w, cam_h, _ = cam.size()
     print("camera %s %dx%d -> panel %dx%d"
-          % (cam.sensor()[0], cam_w, cam_h, display.width, display.height))
+          % ((cam.sensor()[0],) + cam.size()[:2] + (display.width, display.height)))
 
-    w = min(cam_w, display.width)
-    h = min(cam_h, display.height)
-    src_x, src_y = (cam_w - w) // 2, (cam_h - h) // 2
-    dst_x, dst_y = (display.width - w) // 2, (display.height - h) // 2
-    stride = cam_w * 2
-    row_bytes = w * 2
-    print("centre %dx%d crop" % (w, h))
+    # The panel's scanout buffer, which is already DMA-aligned because the
+    # display controller reads it the same way. capture_scaled() writes here
+    # directly; there is no intermediate buffer to allocate.
+    framebuffer = display.framebuffers()[0]
 
-    display.fill(0)
     frames = 0
     t0 = time.ticks_ms()
     try:
         while True:
-            view = cam.frame(500)
-            if view is None:
-                continue        # a missed frame at 35 fps is timing, not failure
-            for y in range(h):
-                off = (src_y + y) * stride + src_x * 2
-                display.blit_rect(view[off:off + row_bytes], dst_x, dst_y + y, w, 1)
-            # Not optional: this panel double-buffers, so blits land in the
-            # back buffer and only show() promotes it. Leave it out and the
-            # screen never changes, which looks exactly like a dead camera.
+            if cam.capture_scaled(framebuffer, display.width, display.height,
+                                  timeout=500) is None:
+                continue    # a missed frame at 35 fps is timing, not failure
+            # Required: the panel only shows the buffer after show() promotes
+            # it. Leave it out and every frame lands and nothing changes,
+            # which looks exactly like a dead camera.
             display.show()
             frames += 1
-            if frames % 20 == 0:
+            if frames % 30 == 0:
                 dt = time.ticks_diff(time.ticks_ms(), t0)
                 print("%d frames, %.1f fps" % (frames, frames * 1000 / dt))
     except KeyboardInterrupt:

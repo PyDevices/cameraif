@@ -26,6 +26,7 @@ target_link_libraries(usermod_cameraif INTERFACE
     idf::esp_driver_cam
     idf::esp_driver_isp
     idf::esp_driver_jpeg
+    idf::esp_driver_ppa
 )
 
 # Note there is deliberately no `-u ov5647_detect` here.

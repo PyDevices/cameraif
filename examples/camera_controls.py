@@ -25,23 +25,16 @@ import board_config
 from board_config import display_drv as display
 
 cam = board_config.camera
-_w = min(cam.size()[0], display.width)
-_h = min(cam.size()[1], display.height)
-_sx, _sy = (cam.size()[0] - _w) // 2, (cam.size()[1] - _h) // 2
-_dx, _dy = (display.width - _w) // 2, (display.height - _h) // 2
-_stride = cam.size()[0] * 2
+_fb = display.framebuffers()[0]
 
 
 def show(seconds=2):
     """Paint what the camera sees, for a while."""
     end = time.ticks_add(time.ticks_ms(), int(seconds * 1000))
     while time.ticks_diff(end, time.ticks_ms()) > 0:
-        view = cam.frame(500)
-        if view is None:
+        if cam.capture_scaled(_fb, display.width, display.height,
+                              timeout=500) is None:
             continue
-        for y in range(_h):
-            off = (_sy + y) * _stride + _sx * 2
-            display.blit_rect(view[off:off + _w * 2], _dx, _dy + y, _w, 1)
         display.show()
 
 

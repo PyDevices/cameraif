@@ -26,14 +26,14 @@ MicroPython would be several seconds per frame.
 ESP32-P4 whose Wi-Fi is an ESP32-C6 co-processor across a hosted link, at
 800x800:
 
-    quality 70    ~74 KB/frame    2.4 fps    ~1.5 Mbit/s
-    quality 40    ~39 KB/frame    3.0 fps    ~0.9 Mbit/s
+    quality 70    ~73 KB/frame     7 fps    ~4.3 Mbit/s
+    quality 40    ~38 KB/frame    15 fps    ~4.6 Mbit/s
 
-Halving the frame size bought only a quarter more frames, so the link is not
-the whole story either -- per-frame overhead is a real share of the cost at
-this size. Both knobs are worth trying on your own network, which is why
+Same bitrate either way, twice the frame rate: that is a link running flat
+out, and the only knob that helps is making the frames smaller. Which is why
 quality is a URL parameter here (``/stream?q=40``) rather than a constant you
-have to edit and re-upload.
+have to edit and re-upload -- the right value depends on your network, not
+on this file.
 The camera itself delivers 35 fps and the encoder keeps up with it; on a
 board with native Wi-Fi, or over Ethernet, this goes much faster.
 """

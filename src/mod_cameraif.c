@@ -55,6 +55,7 @@
 #include "driver/i2c_master.h"
 #include "driver/isp.h"
 #include "driver/jpeg_encode.h"
+#include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -88,6 +89,7 @@ typedef struct {
     esp_cam_ctlr_handle_t cam;
     isp_proc_handle_t isp;
     jpeg_encoder_handle_t jpeg;
+    ppa_client_handle_t ppa;
     uint8_t *jpeg_buf;
     size_t jpeg_buf_size;
     esp_ldo_channel_handle_t ldo;
@@ -174,17 +176,15 @@ static void cameraif_set_para_fraction(uint32_t id, int percent) {
     cameraif_set_para(id, v);
 }
 
-static bool cameraif_queue_buffer(void) {
-    cameraif_obj_t *c = &cameraif_singleton;
-    c->fb_filling = (c->fb_held == 0) ? 1 : 0;
-    esp_cam_ctlr_trans_t trans = {
-        .buffer = c->fb[c->fb_filling], .buflen = c->frame_bytes
-    };
-    // This timeout is queue space, not pixels, and it is in milliseconds --
-    // the driver converts to ticks itself, so pdMS_TO_TICKS() here divides
-    // twice.
-    return esp_cam_ctlr_receive(c->cam, &trans, 100) == ESP_OK;
-}
+// Nothing queues buffers here, and that is not an omission.
+//
+// esp_cam_ctlr_csi's ISR reads its transaction queue only in the `else`
+// branch of `if (ctlr->cbs.on_get_new_trans)`. Registering that callback --
+// which this module must, to hand out the buffer Python is not holding --
+// means the queue is never drained again. esp_cam_ctlr_receive() then fills
+// it once and blocks for its whole timeout on every call afterwards, which
+// measured as a 97 ms wait for a sensor delivering a frame every 28 ms. It
+// looked exactly like a slow camera.
 
 // Complete host teardown. Safe if already clean. Touches no Python objects,
 // because the soft-reset hook runs when the heap is about to be wiped.
@@ -205,6 +205,10 @@ static void cameraif_teardown(void) {
     if (c->jpeg) {
         jpeg_del_encoder_engine(c->jpeg);
         c->jpeg = NULL;
+    }
+    if (c->ppa) {
+        ppa_unregister_client(c->ppa);
+        c->ppa = NULL;
     }
     if (c->jpeg_buf) {
         heap_caps_free(c->jpeg_buf);
@@ -448,6 +452,11 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
             mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("frame buffer"));
         }
     }
+    for (int i = 0; i < 2; i++) {
+        // calloc dirtied every line of this buffer. Push it out now, so a
+        // later eviction cannot land on top of a frame the DMA has written.
+        esp_cache_msync(c->fb[i], c->frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    }
     c->fb_filling = 0;
     c->fb_held = -1;
     c->frame = NULL;
@@ -499,11 +508,10 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         esp_isp_enable(c->isp);
     }
 
+    // esp_cam_ctlr_start() asks on_get_new_trans for the first buffer itself,
+    // so there is nothing to arm here.
     esp_cam_ctlr_start(c->cam);
     c->open = true;
-    // Arm the first transaction. Without a queued buffer the controller
-    // streams into nothing and no callback ever fires.
-    cameraif_queue_buffer();
 
     // OV5647 quirk, applied only to an OV5647.
     //
@@ -571,13 +579,24 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
 
 // Wait for a frame.
 //
-// esp_cam_ctlr_receive() does NOT wait: it queues a buffer for the driver to
-// fill and returns as soon as the queue accepts it. Completion arrives on
-// on_trans_finished. Getting this wrong is silent in both directions, and
-// this module managed both -- callbacks with nothing queued (nothing could
-// complete), then queueing and treating the queue acknowledgement as a frame
-// (capture reported a full frame every time while the buffer never changed).
-static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms) {
+// Frames arrive on their own: the controller asks on_get_new_trans for a
+// buffer, fills it, and signals on_trans_finished. This waits for that
+// signal. An earlier version treated the acknowledgement of a *queued*
+// buffer as a frame, and reported a full frame every time while the buffer
+// never changed -- the failure this module has hit in three different
+// disguises, where the absence of evidence reads as success.
+//
+// cpu_read says whether the caller will read the frame with the CPU.
+//
+// A frame lands in PSRAM by DMA, so a CPU reader sees stale cache until it
+// is invalidated. It costs about 5 ms for 1.28 MB. The JPEG encoder and the
+// PPA are DMA masters
+// that read PSRAM directly and never look at the CPU's cache, so for those
+// the invalidate is pure waste. The buffers are written back once at
+// allocation so no dirty CPU line can survive to be flushed over a frame
+// later.
+static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms,
+    bool cpu_read) {
     if (!c->open) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("camera is deinited"));
     }
@@ -591,25 +610,23 @@ static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms) {
     c->frame = NULL;
     if (xSemaphoreTake(c->frame_ready, ticks) != pdTRUE) {
         c->dropped++;
-        cameraif_queue_buffer();
         return false;
     }
     if (c->last_received == 0) {
         // A completed transaction that carried nothing is not a frame.
         c->dropped++;
-        cameraif_queue_buffer();
         return false;
     }
     // Claim the finished buffer before requeueing, so the buffer we hand the
     // caller is the one the DMA is now forbidden to touch.
     c->fb_held = c->fb_done;
     c->frame = c->fb[c->fb_held];
-    cameraif_queue_buffer();
-    // The frame lands in PSRAM by DMA, so the CPU's view is stale until
-    // invalidated. No UNALIGNED flag: the memory-to-cache direction rejects
-    // it, the sync then silently does nothing, and the caller reads cache --
-    // which for a calloc'd buffer is a perfect, plausible frame of black.
-    esp_cache_msync(c->frame, c->frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    // No UNALIGNED flag: the memory-to-cache direction rejects it, the sync
+    // then silently does nothing, and the caller reads cache -- which for a
+    // calloc'd buffer is a perfect, plausible frame of black.
+    if (cpu_read) {
+        esp_cache_msync(c->frame, c->frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    }
     c->frames++;
     return true;
 }
@@ -627,7 +644,7 @@ static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms) {
 static mp_obj_t cameraif_frame(size_t n_args, const mp_obj_t *args) {
     cameraif_obj_t *c = MP_OBJ_TO_PTR(args[0]);
     mp_int_t timeout = (n_args > 1) ? mp_obj_get_int(args[1]) : 1000;
-    if (!cameraif_wait_frame(c, timeout)) {
+    if (!cameraif_wait_frame(c, timeout, true)) {
         return mp_const_none;
     }
     return mp_obj_new_memoryview('B' | MP_OBJ_ARRAY_TYPECODE_FLAG_RW,
@@ -649,7 +666,7 @@ static mp_obj_t cameraif_capture(size_t n_args, const mp_obj_t *args) {
     mp_int_t timeout = (n_args > 2) ? mp_obj_get_int(args[2]) : 1000;
 
     if (buf_in == mp_const_none) {
-        if (!cameraif_wait_frame(c, timeout)) {
+        if (!cameraif_wait_frame(c, timeout, true)) {
             return mp_const_none;
         }
         return mp_obj_new_bytes(c->frame, c->frame_bytes);
@@ -660,7 +677,7 @@ static mp_obj_t cameraif_capture(size_t n_args, const mp_obj_t *args) {
         mp_raise_msg_varg(&mp_type_ValueError,
             MP_ERROR_TEXT("buffer must be at least %d bytes"), (int)c->frame_bytes);
     }
-    if (!cameraif_wait_frame(c, timeout)) {
+    if (!cameraif_wait_frame(c, timeout, true)) {
         return MP_OBJ_NEW_SMALL_INT(0);
     }
     memcpy(buf.buf, c->frame, c->frame_bytes);
@@ -703,7 +720,7 @@ static mp_obj_t cameraif_capture_yuy2(size_t n_args, const mp_obj_t *args) {
         mp_raise_msg(&mp_type_ValueError,
             MP_ERROR_TEXT("output larger than the sensor frame"));
     }
-    if (!cameraif_wait_frame(c, timeout)) {
+    if (!cameraif_wait_frame(c, timeout, true)) {
         return MP_OBJ_NEW_SMALL_INT(0);
     }
 
@@ -788,7 +805,7 @@ static mp_obj_t cameraif_capture_jpeg(size_t n_args, const mp_obj_t *args) {
         }
         c->jpeg_buf_size = got;
     }
-    if (!cameraif_wait_frame(c, timeout)) {
+    if (!cameraif_wait_frame(c, timeout, false)) {
         return mp_const_none;
     }
     jpeg_encode_cfg_t cfg = {
@@ -1049,6 +1066,128 @@ static mp_obj_t cameraif_test_pattern(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_test_pattern_obj, 1, 2,
     cameraif_test_pattern);
 
+// capture_scaled(dst, pic_w, pic_h, *, x, y, w, h, rotate, mirror, timeout)
+//
+// Scale the next frame into a rectangle of a destination picture, using the
+// P4's Pixel Processing Accelerator. Nothing here touches a pixel with the
+// CPU: the PPA reads the camera's buffer and writes the destination by DMA.
+//
+// The destination is described as a whole picture (pic_w x pic_h) plus the
+// block to write inside it, because that is what a panel framebuffer is --
+// so a preview can hand this its scanout buffer directly and get camera to
+// glass in one hardware operation, rather than one blit per row.
+//
+// dst must be cache-line aligned; the PPA writes it by DMA and a misaligned
+// buffer would corrupt whatever shares its first and last lines. Said with
+// an exception rather than a silent shift, because the corruption would
+// appear somewhere else entirely.
+static mp_obj_t cameraif_capture_scaled(size_t n_args, const mp_obj_t *pos,
+    mp_map_t *kw) {
+    enum { ARG_dst, ARG_pic_w, ARG_pic_h, ARG_x, ARG_y, ARG_w, ARG_h,
+           ARG_rotate, ARG_mirror, ARG_timeout };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_dst,     MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_pic_w,   MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_pic_h,   MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_x,       MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int = 0} },
+        { MP_QSTR_y,       MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int = 0} },
+        { MP_QSTR_w,       MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int = 0} },
+        { MP_QSTR_h,       MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int = 0} },
+        { MP_QSTR_rotate,  MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int = 0} },
+        { MP_QSTR_mirror,  MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
+        { MP_QSTR_timeout, MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int = 1000} },
+    };
+    mp_arg_val_t a[MP_ARRAY_SIZE(allowed)];
+    cameraif_obj_t *c = MP_OBJ_TO_PTR(pos[0]);
+    mp_arg_parse_all(n_args - 1, pos + 1, kw, MP_ARRAY_SIZE(allowed), allowed, a);
+
+    if (!c->open) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("camera is deinited"));
+    }
+    if (c->bytes_per_px != 2) {
+        mp_raise_msg(&mp_type_OSError,
+            MP_ERROR_TEXT("capture_scaled needs an RGB565 camera"));
+    }
+
+    mp_buffer_info_t dst;
+    mp_get_buffer_raise(a[ARG_dst].u_obj, &dst, MP_BUFFER_WRITE);
+
+    const uint32_t pic_w = a[ARG_pic_w].u_int, pic_h = a[ARG_pic_h].u_int;
+    const uint32_t x = a[ARG_x].u_int, y = a[ARG_y].u_int;
+    uint32_t w = a[ARG_w].u_int ? (uint32_t)a[ARG_w].u_int : pic_w - x;
+    uint32_t h = a[ARG_h].u_int ? (uint32_t)a[ARG_h].u_int : pic_h - y;
+    if (pic_w == 0 || pic_h == 0 || w == 0 || h == 0
+        || x + w > pic_w || y + h > pic_h) {
+        mp_raise_ValueError(MP_ERROR_TEXT("block does not fit the picture"));
+    }
+    if (dst.len < (size_t)pic_w * pic_h * 2) {
+        mp_raise_msg_varg(&mp_type_ValueError,
+            MP_ERROR_TEXT("dst must be at least %d bytes"), (int)(pic_w * pic_h * 2));
+    }
+    size_t align = 0;
+    esp_cache_get_alignment(0, &align);
+    if (align && ((uintptr_t)dst.buf % align)) {
+        mp_raise_msg_varg(&mp_type_ValueError,
+            MP_ERROR_TEXT("dst must be %d-byte aligned for DMA"), (int)align);
+    }
+
+    if (c->ppa == NULL) {
+        ppa_client_config_t pc = { .oper_type = PPA_OPERATION_SRM };
+        if (ppa_register_client(&pc, &c->ppa) != ESP_OK) {
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no PPA client"));
+        }
+    }
+
+    if (!cameraif_wait_frame(c, a[ARG_timeout].u_int, false)) {
+        return mp_const_none;
+    }
+
+    static const ppa_srm_rotation_angle_t angles[4] = {
+        PPA_SRM_ROTATION_ANGLE_0, PPA_SRM_ROTATION_ANGLE_90,
+        PPA_SRM_ROTATION_ANGLE_180, PPA_SRM_ROTATION_ANGLE_270,
+    };
+    int rot = a[ARG_rotate].u_int;
+    if (rot % 90) {
+        mp_raise_ValueError(MP_ERROR_TEXT("rotate must be 0, 90, 180 or 270"));
+    }
+    rot = ((rot / 90) % 4 + 4) % 4;
+
+    // Rotation happens after scaling, so at 90 or 270 the scale factors are
+    // the ones that make the *rotated* result fill w x h.
+    const bool swap = (rot == 1 || rot == 3);
+    ppa_srm_oper_config_t op = {
+        .in = {
+            .buffer = c->frame,
+            .pic_w = c->width, .pic_h = c->height,
+            .block_w = c->width, .block_h = c->height,
+            .block_offset_x = 0, .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer = dst.buf,
+            .buffer_size = (uint32_t)dst.len,
+            .pic_w = pic_w, .pic_h = pic_h,
+            .block_offset_x = x, .block_offset_y = y,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = angles[rot],
+        .scale_x = (float)(swap ? h : w) / (float)c->width,
+        .scale_y = (float)(swap ? w : h) / (float)c->height,
+        .mirror_x = a[ARG_mirror].u_bool,
+        .mirror_y = false,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    esp_err_t err = ppa_do_scale_rotate_mirror(c->ppa, &op);
+    if (err != ESP_OK) {
+        mp_raise_msg_varg(&mp_type_OSError,
+            MP_ERROR_TEXT("PPA scale failed (%d)"), (int)err);
+    }
+    mp_obj_t size[2] = { MP_OBJ_NEW_SMALL_INT(w), MP_OBJ_NEW_SMALL_INT(h) };
+    return mp_obj_new_tuple(2, size);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(cameraif_capture_scaled_obj, 4,
+    cameraif_capture_scaled);
+
 // reg(addr) / reg(addr, value): read or write one sensor register.
 //
 // Deliberately exposed. A camera that answers I2C and sends no pixels is
@@ -1119,6 +1258,7 @@ static const mp_rom_map_elem_t cameraif_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_size), MP_ROM_PTR(&cameraif_size_obj) },
     { MP_ROM_QSTR(MP_QSTR_sensor), MP_ROM_PTR(&cameraif_sensor_obj) },
     { MP_ROM_QSTR(MP_QSTR_formats), MP_ROM_PTR(&cameraif_formats_obj) },
+    { MP_ROM_QSTR(MP_QSTR_capture_scaled), MP_ROM_PTR(&cameraif_capture_scaled_obj) },
     { MP_ROM_QSTR(MP_QSTR_controls), MP_ROM_PTR(&cameraif_controls_obj) },
     { MP_ROM_QSTR(MP_QSTR_exposure), MP_ROM_PTR(&cameraif_exposure_obj) },
     { MP_ROM_QSTR(MP_QSTR_gain), MP_ROM_PTR(&cameraif_gain_obj) },

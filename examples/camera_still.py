@@ -39,12 +39,9 @@ PREVIEW_MS = 30
 app = appdev.App(board_config)
 cam = board_config.camera
 
-cam_w, cam_h, _ = cam.size()
-w = min(cam_w, display.width)
-h = min(cam_h, display.height)
-src_x, src_y = (cam_w - w) // 2, (cam_h - h) // 2
-dst_x, dst_y = (display.width - w) // 2, (display.height - h) // 2
-stride = cam_w * 2
+# The panel's own scanout buffer. capture_scaled() scales the frame into it
+# with the PPA, by DMA, so the live view costs the CPU one call per frame.
+framebuffer = display.framebuffers()[0]
 
 count = 0
 busy = False
@@ -73,12 +70,9 @@ def draw_preview(_=None):
     global busy
     if busy:
         return              # never paint over a shot being taken
-    view = cam.frame(200)
-    if view is None:
+    if cam.capture_scaled(framebuffer, display.width, display.height,
+                          timeout=200) is None:
         return
-    for y in range(h):
-        off = (src_y + y) * stride + src_x * 2
-        display.blit_rect(view[off:off + w * 2], dst_x, dst_y + y, w, 1)
     display.show()
 
 

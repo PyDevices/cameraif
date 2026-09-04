@@ -8,45 +8,56 @@ board's filesystem. Press again for another. Fetch them with::
     mpremote ls
     mpremote cp :photo_001.jpg .
 
-**How the button gets here.** `board_config` publishes the BOOT button as
-`keypad_read()`, which returns the key codes currently held. Nothing in this
-file knows which GPIO it is or that it is active-low, so the same file works
-on a board that wires its shutter somewhere else. The press is an edge --
-held now, not held last time -- because a button read every 50 ms is held
-down across many reads and a level would fire the shutter continuously.
+**How the button gets here.** `board_config` publishes the BOOT button
+through `keypad_read`, and `appdev` turns that into ordinary KEYDOWN events
+-- the same events a USB keyboard would produce. Nothing in this file knows
+which GPIO it is or that it is active-low, which is why the same file works
+on a board that wires its shutter somewhere else.
 
-**Why there is no `appdev.App` here, and when you should still use one.**
-`appdev` is the right home for most applications: it owns the scheduler,
-polls the input devices, dispatches events, and calls `show()`. Use it. This
-program is the exception, and the reason is measured rather than assumed --
-on this board, the identical preview loop runs at:
+**On the shape of this file.** `appdev` is the scheduler. It polls the input
+devices, dispatches the events, and keeps the program alive after the last
+line runs -- so there is no `while True` here and no `app.run()` at the
+bottom. The preview is on `app.every()` because repainting is genuinely
+periodic work of our own; the shutter is on `app.on()` because it happens
+when it happens. Anything drawn must be followed by `display_drv.show()`,
+which is what actually puts the back buffer on the glass.
 
-    18.7 fps   plain loop, board_config.keypad_read() read directly
-     2.0 fps   the same loop with an appdev.App constructed
+**Why the shutter only sets a flag.** Both callbacks are dispatched by the
+same scheduler, so the button can fire between preview frames. Taking the
+picture inside the handler would put a second piece of camera work next to
+the first; recording the request and letting the next tick do exactly one
+thing keeps all the hardware use in one place.
 
-and the App version then trips the interrupt watchdog and resets the board.
-Nine times slower is not a tuning problem, so this example does the simple
-thing that works. A camera preview is an unusual load -- it saturates the
-memory bus with DMA from the sensor, the scaler and the panel at once -- and
-that appears to be what the App's 10 ms service timer collides with. If you
-are writing something that is not a continuous full-frame video loop, reach
-for `appdev` first.
+**Hold the button for a moment.** The scheduler alternates between preview
+frames and input polling, and a preview frame costs about 54 ms, so the
+button is read a handful of times a second rather than continuously. A very
+quick tap can fall between two reads.
 
-**Stopping it.** Ctrl-C works, because the loop is ours.
+**Stopping it.** Ctrl-C will not: `appdev` drives this from a hardware timer,
+and interrupting the callback leaves the timer armed to fire the next one.
+Press the board's reset button, or::
+
+    python -m esptool --chip esp32p4 --port COMn --after hard_reset chip-id
 """
 
+import appdev
 import board_config
 from board_config import display_drv as display
 
 QUALITY = 90
+# The preview costs about 54 ms a frame, so a period below that would eat the
+# scheduler the input polling shares.
+PREVIEW_MS = 100
 
+app = appdev.App(board_config)
 cam = board_config.camera
 
-# The panel's scanout buffer. capture_scaled() scales the camera frame into
-# it with the PPA, by DMA, so the live view costs the CPU one call per frame.
+# The panel's own scanout buffer. capture_scaled() scales the camera frame
+# into it with the PPA, by DMA, so the live view costs the CPU one call.
 framebuffer = display.framebuffers()[0]
 
 count = 0
+shot_requested = False
 
 
 def next_filename():
@@ -66,6 +77,12 @@ def next_filename():
     while ("photo_%03d.jpg" % n) in existing:
         n += 1
     return "photo_%03d.jpg" % n
+
+
+def shutter(_event):
+    """The button. Records the request; the next tick does the work."""
+    global shot_requested
+    shot_requested = True
 
 
 def take_photo():
@@ -95,26 +112,18 @@ def take_photo():
         display.fill(0)
 
 
-def main():
-    print("Live view up. Press BOOT to take a picture.")
-    held = set()
-    try:
-        while True:
-            now = set(board_config.keypad_read() or ())
-            pressed = now - held      # the edge, not the level
-            held = now
-            if pressed:
-                take_photo()
-            elif cam.capture_scaled(framebuffer, display.width, display.height,
-                                    timeout=200) is not None:
-                # Required: the panel only shows a buffer after show()
-                # promotes it.
-                display.show()
-    except KeyboardInterrupt:
-        print("stopped after %d picture%s" % (count, "" if count == 1 else "s"))
-    finally:
-        cam.deinit()
+def tick(_=None):
+    """The one place camera work happens: a photo, or a preview frame."""
+    global shot_requested
+    if shot_requested:
+        shot_requested = False
+        take_photo()
+    elif cam.capture_scaled(framebuffer, display.width, display.height,
+                            timeout=200) is not None:
+        display.show()
 
 
-if __name__ == "__main__":
-    main()
+app.on(app.events.KEYDOWN, shutter)
+app.every(PREVIEW_MS, tick)
+
+print("Live view up. Press BOOT to take a picture.")

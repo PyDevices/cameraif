@@ -53,6 +53,7 @@
 #include "esp_sccb_intf.h"
 #include "esp_sccb_i2c.h"
 #include "driver/i2c_master.h"
+#include "esp_private/esp_gpio_reserve.h"
 #include "driver/isp.h"
 #include "driver/jpeg_encode.h"
 #include "driver/ppa.h"
@@ -94,6 +95,7 @@ typedef struct {
     size_t jpeg_buf_size;
     esp_ldo_channel_handle_t ldo;
     i2c_master_bus_handle_t i2c;
+    bool owns_i2c;              // false when we joined machine.I2C's bus
     esp_sccb_io_handle_t sccb;
     esp_cam_sensor_device_t *sensor;
     SemaphoreHandle_t frame_ready;
@@ -226,8 +228,13 @@ static void cameraif_teardown(void) {
         c->sccb = NULL;
     }
     if (c->i2c) {
-        i2c_del_master_bus(c->i2c);
+        // Only tear down a bus this module created. Deleting one that
+        // machine.I2C owns would take the panel's touch controller with it.
+        if (c->owns_i2c) {
+            i2c_del_master_bus(c->i2c);
+        }
         c->i2c = NULL;
+        c->owns_i2c = false;
     }
     if (c->ldo) {
         esp_ldo_release_channel(c->ldo);
@@ -323,17 +330,50 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("MIPI PHY LDO unavailable"));
     }
 
-    i2c_master_bus_config_t i2c_cfg = {
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = args[ARG_i2c].u_int,
-        .scl_io_num = args[ARG_scl].u_int,
-        .sda_io_num = args[ARG_sda].u_int,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    if (i2c_new_master_bus(&i2c_cfg, &c->i2c) != ESP_OK) {
-        cameraif_teardown();
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("SCCB bus init failed"));
+    // Join the bus if this port already has one; only build a bus if it does
+    // not.
+    //
+    // On boards where the camera connector shares the panel's I2C -- which is
+    // the common arrangement, and is this board's -- something else is
+    // already driving those pins. Creating a second master for the same wires
+    // does not fail: both peripherals are routed to the pins through the
+    // matrix and both appear to work, until the other device is next read and
+    // times out. Here that meant opening a camera silently killed the
+    // touchscreen, and every symptom pointed somewhere else entirely.
+    if (i2c_master_get_bus_handle(args[ARG_i2c].u_int, &c->i2c) == ESP_OK
+        && c->i2c != NULL) {
+        c->owns_i2c = false;
+    } else {
+        // Refuse to open a second master on pins something already owns.
+        //
+        // esp-idf's I2C driver reserves its pins but only *warns* when they
+        // are already taken, then routes a second peripheral to the same
+        // wires through the pin matrix. Nothing fails and nothing looks
+        // wrong: this camera worked perfectly while the panel's touch
+        // controller, on the same two pins under machine.I2C, timed out on
+        // every read. Naming it here costs one call and saves the next
+        // person the evening it cost this one.
+        if (esp_gpio_is_reserved(BIT64(args[ARG_sda].u_int)
+                                 | BIT64(args[ARG_scl].u_int))) {
+            cameraif_teardown();
+            mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT(
+                "GPIO %d/%d already belong to another driver; pass i2c=<port> "
+                "for the bus that owns them"),
+                args[ARG_sda].u_int, args[ARG_scl].u_int);
+        }
+        i2c_master_bus_config_t i2c_cfg = {
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .i2c_port = args[ARG_i2c].u_int,
+            .scl_io_num = args[ARG_scl].u_int,
+            .sda_io_num = args[ARG_sda].u_int,
+            .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        if (i2c_new_master_bus(&i2c_cfg, &c->i2c) != ESP_OK) {
+            cameraif_teardown();
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("SCCB bus init failed"));
+        }
+        c->owns_i2c = true;
     }
 
     // Detection is a linker-section walk, not a call: each driver registers a

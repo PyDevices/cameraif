@@ -71,7 +71,7 @@ time — the P4 has one CSI controller — and constructing a second one raises.
 | Argument | Default | Meaning |
 |---|---|---|
 | `sda`, `scl` | — | I2C pins the sensor answers on (SCCB) |
-| `i2c` | `0` | I2C port number |
+| `i2c` | `0` | I2C port. **Use the port that already owns these pins** — see below |
 | `ldo_chan` | `3` | LDO channel powering the MIPI D-PHY |
 | `ldo_mv` | `2500` | LDO voltage, millivolts |
 | `reset` | `-1` | Sensor reset pin, `-1` for none |
@@ -90,6 +90,27 @@ time — the P4 has one CSI controller — and constructing a second one raises.
 Board facts are arguments rather than build-time constants on purpose: the
 same firmware image should drive a camera on any board that has one, and a
 pin number is not a reason to recompile.
+
+#### Sharing the bus, which is the one that will bite you
+
+On most boards the camera connector's SCCB lines are the panel's I2C bus,
+shared with the touch controller and often the audio codecs. `i2c` must name
+the port that bus is already on. Given a port that already has a bus,
+`cameraif` attaches to it; given a free port, it opens its own.
+
+Get this wrong and nothing reports an error. Both peripherals reach the pins
+through the ESP32's pin matrix, `CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK` (set
+by MicroPython upstream) suppresses the one check that would have caught it,
+and the camera works perfectly — while every read of whatever else lives on
+that bus times out. On this board that was the touchscreen, and the symptom
+looked like a scheduler problem two layers away.
+
+Two things guard it now. `cameraif` refuses to open a second master on pins
+another driver has reserved, naming the port to pass instead. And
+`machine.I2C` on the ESP32-P4 is built on esp-idf's new `i2c_master` driver
+(`cmods/patches/cameraif-02-…`), because the legacy driver it used before
+cannot hand out a bus handle to share and does not reserve its pins, so
+neither the sharing nor the check was possible.
 
 ### Getting frames
 
@@ -271,13 +292,9 @@ The examples take the camera from `board_config`, so they run unchanged on
 any board whose config provides one. On a board without one, construct a
 `Camera` directly with your own pins.
 
-One caution, measured on the ESP32-P4 and written up in `camera_still.py`:
-constructing an `appdev.App` alongside a continuous full-frame preview drops
-it from 18.7 fps to 2.0 and then trips the interrupt watchdog. A camera
-preview keeps the sensor, the scaler and the panel all moving data through
-PSRAM at once, which is an unusual load for a 10 ms service timer to sit on
-top of. None of these examples use a scheduler; for anything that is not a
-continuous video loop, reach for `appdev` first.
+`camera_still.py` is the one that uses `appdev` as the scheduler, which is
+the house idiom for an application with input; the rest are plain scripts
+because they have nothing to schedule.
 
 ## Performance, measured
 

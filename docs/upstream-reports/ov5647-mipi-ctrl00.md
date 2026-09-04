@@ -76,6 +76,18 @@ and gain.
 The distinguishing bit is **CLOCK_LANE_GATE**. Both values that set it
 stream; neither value without it does.
 
+**One caveat, so a maintainer who sees otherwise does not doubt the rest.**
+A second session here measured `0x04` streaming at 28 fps, under a different
+protocol: it wrote `0x0100 = 0`, then `0x4800 = 0x04`, then `0x0100 = 1` — a
+stop/start of the sensor's standby bit *after* the receiver was already
+running. The table above leaves `0x0100` untouched and gets 0 frames for the
+same value. Both results are correct under their own conditions.
+
+So a standby restart can apparently also start transmission with a gate-less
+value. We did not chase why, and it does not affect the diagnosis or the fix:
+with the shipped default and no such restart — which is what every consumer
+of this driver actually does — the sensor does not transmit.
+
 ## Suggested fix
 
 Write the value the function already computed:

@@ -18,6 +18,16 @@ target_include_directories(usermod_cameraif INTERFACE
     ${CAMERAIF_SRC_DIR}
 )
 
+# The IDF components this module drives. Declared rather than assumed: a
+# usermod is an INTERFACE library added to `main`, so it only sees what main
+# already required -- esp_driver_cam and esp_driver_jpeg are not in that set,
+# and without these the headers are simply not on the include path.
+target_link_libraries(usermod_cameraif INTERFACE
+    idf::esp_driver_cam
+    idf::esp_driver_isp
+    idf::esp_driver_jpeg
+)
+
 # Note there is deliberately no `-u ov5647_detect` here.
 #
 # Sensor drivers register their probe in a linker section that nothing in C

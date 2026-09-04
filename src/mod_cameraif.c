@@ -30,6 +30,7 @@
 #include "py/runtime.h"
 #include "py/obj.h"
 #include "py/mphal.h"
+#include "py/objarray.h"
 
 #if defined(__has_include)
 #if __has_include("sdkconfig.h")
@@ -53,6 +54,7 @@
 #include "esp_sccb_i2c.h"
 #include "driver/i2c_master.h"
 #include "driver/isp.h"
+#include "driver/jpeg_encode.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -72,9 +74,22 @@ typedef struct {
     uint16_t width, height;
     size_t frame_bytes;
     uint8_t bytes_per_px;
-    uint8_t *frame;
+    uint8_t *fb[2];
+    uint8_t *frame;             // the buffer Python may read; never queued
+    // Which buffer belongs to whom. The DMA and the Python reader must never
+    // hold the same one: at 35 fps the driver refills a buffer every 28 ms
+    // while a 1.28 MB read takes ~100 ms, so a single buffer tears three
+    // times per frame. A still subject cannot show that -- every pixel it
+    // tears to is the same pixel -- which is why one buffer looked correct.
+    volatile int8_t fb_filling;  // index the driver is writing
+    volatile int8_t fb_held;     // index Python is reading, or -1
+    volatile int8_t fb_done;     // index of the most recently completed frame
+    bool test_pattern;           // last requested; the ioctl has no read side
     esp_cam_ctlr_handle_t cam;
     isp_proc_handle_t isp;
+    jpeg_encoder_handle_t jpeg;
+    uint8_t *jpeg_buf;
+    size_t jpeg_buf_size;
     esp_ldo_channel_handle_t ldo;
     i2c_master_bus_handle_t i2c;
     esp_sccb_io_handle_t sccb;
@@ -100,7 +115,11 @@ static bool IRAM_ATTR cameraif_on_get_new_trans(esp_cam_ctlr_handle_t handle,
     (void)handle;
     (void)user_data;
     cameraif_obj_t *c = &cameraif_singleton;
-    trans->buffer = c->frame;
+    // Whatever Python is not holding. With two buffers and one held, the
+    // driver keeps refilling the other -- overwriting frames the reader was
+    // too slow for, which is what a preview wants anyway.
+    c->fb_filling = (c->fb_held == 0) ? 1 : 0;
+    trans->buffer = c->fb[c->fb_filling];
     trans->buflen = c->frame_bytes;
     c->isr_new++;
     return false;
@@ -114,6 +133,7 @@ static bool IRAM_ATTR cameraif_on_trans_finished(esp_cam_ctlr_handle_t handle,
     BaseType_t woken = pdFALSE;
     c->isr_done++;
     c->last_received = (uint32_t)trans->received_size;
+    c->fb_done = (int8_t)c->fb_filling;
     if (c->frame_ready) {
         // Give, never take: a frame arriving while the last is unread is not
         // an error, it is the normal case at 50 fps with a Python reader.
@@ -156,7 +176,10 @@ static void cameraif_set_para_fraction(uint32_t id, int percent) {
 
 static bool cameraif_queue_buffer(void) {
     cameraif_obj_t *c = &cameraif_singleton;
-    esp_cam_ctlr_trans_t trans = { .buffer = c->frame, .buflen = c->frame_bytes };
+    c->fb_filling = (c->fb_held == 0) ? 1 : 0;
+    esp_cam_ctlr_trans_t trans = {
+        .buffer = c->fb[c->fb_filling], .buflen = c->frame_bytes
+    };
     // This timeout is queue space, not pixels, and it is in milliseconds --
     // the driver converts to ticks itself, so pdMS_TO_TICKS() here divides
     // twice.
@@ -179,6 +202,15 @@ static void cameraif_teardown(void) {
         esp_isp_del_processor(c->isp);
         c->isp = NULL;
     }
+    if (c->jpeg) {
+        jpeg_del_encoder_engine(c->jpeg);
+        c->jpeg = NULL;
+    }
+    if (c->jpeg_buf) {
+        heap_caps_free(c->jpeg_buf);
+        c->jpeg_buf = NULL;
+        c->jpeg_buf_size = 0;
+    }
     if (c->sensor) {
         int off = 0;
         esp_cam_sensor_ioctl(c->sensor, ESP_CAM_SENSOR_IOC_S_STREAM, &off);
@@ -197,10 +229,13 @@ static void cameraif_teardown(void) {
         esp_ldo_release_channel(c->ldo);
         c->ldo = NULL;
     }
-    if (c->frame) {
-        heap_caps_free(c->frame);
-        c->frame = NULL;
+    for (int i = 0; i < 2; i++) {
+        if (c->fb[i]) {
+            heap_caps_free(c->fb[i]);
+            c->fb[i] = NULL;
+        }
     }
+    c->frame = NULL;
     if (c->frame_ready) {
         vSemaphoreDelete(c->frame_ready);
         c->frame_ready = NULL;
@@ -405,12 +440,17 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
 
     size_t align = 0;
     esp_cache_get_alignment(0, &align);
-    c->frame = heap_caps_aligned_calloc(align ? align : 64, 1, c->frame_bytes,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (c->frame == NULL) {
-        cameraif_teardown();
-        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("frame buffer"));
+    for (int i = 0; i < 2; i++) {
+        c->fb[i] = heap_caps_aligned_calloc(align ? align : 64, 1, c->frame_bytes,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (c->fb[i] == NULL) {
+            cameraif_teardown();
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("frame buffer"));
+        }
     }
+    c->fb_filling = 0;
+    c->fb_held = -1;
+    c->frame = NULL;
     c->frame_ready = xSemaphoreCreateBinary();
 
     esp_cam_ctlr_csi_config_t csi_cfg = {
@@ -545,6 +585,10 @@ static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms) {
     if (ticks == 0) {
         ticks = 1;      // never round a real wait down to a poll
     }
+    // Release the previous frame first: while Python held it the driver had
+    // only one buffer, so let it have both back before we wait.
+    c->fb_held = -1;
+    c->frame = NULL;
     if (xSemaphoreTake(c->frame_ready, ticks) != pdTRUE) {
         c->dropped++;
         cameraif_queue_buffer();
@@ -556,15 +600,40 @@ static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms) {
         cameraif_queue_buffer();
         return false;
     }
+    // Claim the finished buffer before requeueing, so the buffer we hand the
+    // caller is the one the DMA is now forbidden to touch.
+    c->fb_held = c->fb_done;
+    c->frame = c->fb[c->fb_held];
+    cameraif_queue_buffer();
     // The frame lands in PSRAM by DMA, so the CPU's view is stale until
     // invalidated. No UNALIGNED flag: the memory-to-cache direction rejects
     // it, the sync then silently does nothing, and the caller reads cache --
     // which for a calloc'd buffer is a perfect, plausible frame of black.
     esp_cache_msync(c->frame, c->frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     c->frames++;
-    cameraif_queue_buffer();
     return true;
 }
+
+// frame(timeout=1000) -> memoryview | None
+//
+// The frame where it landed, with no copy at all. capture() into a bytearray
+// spends ~100 ms moving 1.28 MB that the caller usually only reads once; a
+// preview loop wants to blit straight out of DMA memory.
+//
+// The view stays valid until the next frame()/capture() call on this camera,
+// which releases the buffer back to the driver. Reading it after that is
+// reading a frame the sensor is overwriting -- so treat it as borrowed, and
+// copy anything you need to keep.
+static mp_obj_t cameraif_frame(size_t n_args, const mp_obj_t *args) {
+    cameraif_obj_t *c = MP_OBJ_TO_PTR(args[0]);
+    mp_int_t timeout = (n_args > 1) ? mp_obj_get_int(args[1]) : 1000;
+    if (!cameraif_wait_frame(c, timeout)) {
+        return mp_const_none;
+    }
+    return mp_obj_new_memoryview('B' | MP_OBJ_ARRAY_TYPECODE_FLAG_RW,
+        c->frame_bytes, c->frame);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_frame_obj, 1, 2, cameraif_frame);
 
 // capture(buf=None, timeout=1000)
 //
@@ -673,6 +742,72 @@ static mp_obj_t cameraif_capture_yuy2(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_yuy2_obj, 4, 5,
     cameraif_capture_yuy2);
 
+// capture_jpeg(quality=80, timeout=1000) -> bytes
+//
+// Uses the P4's hardware JPEG encoder, which takes RGB565 directly -- the
+// same thing the ISP already produces, so a frame goes sensor -> ISP ->
+// encoder with no software conversion anywhere.
+//
+// This is what makes MJPEG practical on this board. A UVC device advertising
+// uncompressed YUY2 is limited by bus bandwidth to small frames; the same
+// bus carries 800x800 comfortably once each frame is a JPEG a tenth the
+// size. It is also what a still is usually wanted as.
+//
+// The encoder and its output buffer are created on first use and freed by
+// teardown, so a program that never asks for JPEG pays nothing for it.
+static mp_obj_t cameraif_capture_jpeg(size_t n_args, const mp_obj_t *args) {
+    cameraif_obj_t *c = MP_OBJ_TO_PTR(args[0]);
+    mp_int_t quality = (n_args > 1) ? mp_obj_get_int(args[1]) : 80;
+    mp_int_t timeout = (n_args > 2) ? mp_obj_get_int(args[2]) : 1000;
+
+    if (c->bytes_per_px != 2) {
+        mp_raise_msg(&mp_type_ValueError,
+            MP_ERROR_TEXT("capture_jpeg needs an rgb565 camera"));
+    }
+    if (quality < 1 || quality > 100) {
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("quality is 1..100"));
+    }
+    if (c->jpeg == NULL) {
+        jpeg_encode_engine_cfg_t eng = { .timeout_ms = 200 };
+        if (jpeg_new_encoder_engine(&eng, &c->jpeg) != ESP_OK) {
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no JPEG encoder"));
+        }
+        // Generous: a JPEG is far smaller than its source, but a
+        // high-quality encode of a noisy frame is not as small as one
+        // expects, and an output buffer that is merely usually big enough
+        // fails on exactly the frames worth keeping.
+        jpeg_encode_memory_alloc_cfg_t mcfg = {
+            .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER,
+        };
+        size_t got = 0;
+        c->jpeg_buf = jpeg_alloc_encoder_mem(c->frame_bytes / 2, &mcfg, &got);
+        if (c->jpeg_buf == NULL) {
+            jpeg_del_encoder_engine(c->jpeg);
+            c->jpeg = NULL;
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("JPEG buffer"));
+        }
+        c->jpeg_buf_size = got;
+    }
+    if (!cameraif_wait_frame(c, timeout)) {
+        return mp_const_none;
+    }
+    jpeg_encode_cfg_t cfg = {
+        .width = c->width,
+        .height = c->height,
+        .src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
+        .sub_sample = JPEG_DOWN_SAMPLING_YUV420,
+        .image_quality = (uint32_t)quality,
+    };
+    uint32_t out_len = 0;
+    if (jpeg_encoder_process(c->jpeg, &cfg, c->frame, c->frame_bytes,
+            c->jpeg_buf, c->jpeg_buf_size, &out_len) != ESP_OK) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("JPEG encode failed"));
+    }
+    return mp_obj_new_bytes(c->jpeg_buf, out_len);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_jpeg_obj, 1, 3,
+    cameraif_capture_jpeg);
+
 // --- introspection and controls -----------------------------------------
 
 static mp_obj_t cameraif_size(mp_obj_t self_in) {
@@ -723,45 +858,168 @@ static mp_obj_t cameraif_formats(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(cameraif_formats_obj, cameraif_formats);
 
-// Read or set one sensor parameter, in the sensor's own units. Returned as
-// (current, minimum, maximum) so a caller can move within the range the
-// sensor actually offers instead of guessing.
+// Read or set one sensor parameter.
+//
+// Percent of the range the sensor advertises, by default, because the raw
+// units are not portable: exposure is in lines, gain is in driver-specific
+// steps, and both ranges move when the format does. A literal that suits one
+// mode is quietly wrong in another, and a caller who has to know the units
+// has to know the sensor. `raw=True` gives the sensor's own numbers to
+// anyone who does.
+//
+// Reading returns None when the driver cannot answer, rather than a number.
+// The earlier version ignored esp_cam_sensor_get_para_value()'s return code
+// and handed back the zero it had initialised, so a sensor with no read
+// support reported a confident, plausible exposure of 0.
 static mp_obj_t cameraif_para(cameraif_obj_t *c, uint32_t id, size_t n_args,
-    const mp_obj_t *args) {
+    const mp_obj_t *args, mp_map_t *kw) {
     if (!c->sensor) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("camera is deinited"));
     }
+    mp_map_elem_t *e = kw ? mp_map_lookup(kw, MP_OBJ_NEW_QSTR(MP_QSTR_raw),
+        MP_MAP_LOOKUP) : NULL;
+    const bool raw = e && mp_obj_is_true(e->value);
+
+    esp_cam_sensor_param_desc_t desc = { .id = id };
+    const bool have_range =
+        esp_cam_sensor_query_para_desc(c->sensor, &desc) == ESP_OK
+        && desc.number.maximum > desc.number.minimum;
+
     if (n_args >= 2 && args[1] != mp_const_none) {
         int32_t v = (int32_t)mp_obj_get_int(args[1]);
+        if (!raw) {
+            if (!have_range) {
+                mp_raise_msg(&mp_type_OSError,
+                    MP_ERROR_TEXT("sensor advertises no range for this control"));
+            }
+            if (v < 0 || v > 100) {
+                mp_raise_ValueError(MP_ERROR_TEXT("percent must be 0-100"));
+            }
+            const int32_t lo = desc.number.minimum, hi = desc.number.maximum;
+            v = lo + (int32_t)(((int64_t)(hi - lo) * v) / 100);
+            if (desc.number.step > 1) {
+                v -= (v - lo) % (int32_t)desc.number.step;
+            }
+        }
         if (esp_cam_sensor_set_para_value(c->sensor, id, &v, sizeof(v)) != ESP_OK) {
             mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sensor rejected value"));
         }
     }
-    esp_cam_sensor_param_desc_t desc = { .id = id };
+
     int32_t cur = 0;
-    esp_cam_sensor_get_para_value(c->sensor, id, &cur, sizeof(cur));
-    if (esp_cam_sensor_query_para_desc(c->sensor, &desc) != ESP_OK) {
-        return MP_OBJ_NEW_SMALL_INT(cur);
+    if (esp_cam_sensor_get_para_value(c->sensor, id, &cur, sizeof(cur)) != ESP_OK) {
+        return mp_const_none;       // unreadable is not zero
     }
-    mp_obj_t items[3] = {
-        MP_OBJ_NEW_SMALL_INT(cur),
-        MP_OBJ_NEW_SMALL_INT(desc.number.minimum),
-        MP_OBJ_NEW_SMALL_INT(desc.number.maximum),
-    };
-    return mp_obj_new_tuple(3, items);
+    if (raw) {
+        mp_obj_t items[4] = {
+            MP_OBJ_NEW_SMALL_INT(cur),
+            MP_OBJ_NEW_SMALL_INT(have_range ? desc.number.minimum : 0),
+            MP_OBJ_NEW_SMALL_INT(have_range ? desc.number.maximum : 0),
+            MP_OBJ_NEW_SMALL_INT(have_range ? desc.number.step : 0),
+        };
+        return mp_obj_new_tuple(4, items);
+    }
+    if (!have_range) {
+        return mp_const_none;       // no range means no percent to report
+    }
+    const int32_t lo = desc.number.minimum, hi = desc.number.maximum;
+    return MP_OBJ_NEW_SMALL_INT(((int64_t)(cur - lo) * 100) / (hi - lo));
 }
 
+// Booleans that live in the sensor. Same parameter mechanism, but a flip is
+// on or off -- reporting it as a percentage of a two-value range would be
+// technically true and useless.
+static mp_obj_t cameraif_para_bool(cameraif_obj_t *c, uint32_t id,
+    size_t n_args, const mp_obj_t *args) {
+    if (!c->sensor) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("camera is deinited"));
+    }
+    if (n_args >= 2 && args[1] != mp_const_none) {
+        int32_t v = mp_obj_is_true(args[1]) ? 1 : 0;
+        if (esp_cam_sensor_set_para_value(c->sensor, id, &v, sizeof(v)) != ESP_OK) {
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sensor rejected value"));
+        }
+    }
+    int32_t cur = 0;
+    if (esp_cam_sensor_get_para_value(c->sensor, id, &cur, sizeof(cur)) != ESP_OK) {
+        return mp_const_none;
+    }
+    return mp_obj_new_bool(cur != 0);
+}
+
+// controls() -> {name: (minimum, maximum, step)}
+//
+// Only what the driver in this firmware actually advertises. Worth its size:
+// the sensor drivers vary enormously in how much they implement -- the
+// OV5647's, for instance, offers exactly three parameters and cannot read
+// any of them back -- and without this a caller discovers that by calling
+// things and catching OSError.
+static mp_obj_t cameraif_controls(mp_obj_t self_in) {
+    cameraif_obj_t *c = MP_OBJ_TO_PTR(self_in);
+    if (!c->sensor) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("camera is deinited"));
+    }
+    static const struct { uint16_t q; uint32_t id; } known[] = {
+        { MP_QSTR_exposure,   ESP_CAM_SENSOR_EXPOSURE_VAL },
+        { MP_QSTR_gain,       ESP_CAM_SENSOR_GAIN },
+        { MP_QSTR_gain,       ESP_CAM_SENSOR_ANGAIN },
+        { MP_QSTR_flip,       ESP_CAM_SENSOR_VFLIP },
+        { MP_QSTR_mirror,     ESP_CAM_SENSOR_HMIRROR },
+        { MP_QSTR_brightness, ESP_CAM_SENSOR_BRIGHTNESS },
+        { MP_QSTR_contrast,   ESP_CAM_SENSOR_CONTRAST },
+        { MP_QSTR_saturation, ESP_CAM_SENSOR_SATURATION },
+        { MP_QSTR_sharpness,  ESP_CAM_SENSOR_SHARPNESS },
+        { MP_QSTR_denoise,    ESP_CAM_SENSOR_DENOISE },
+        { MP_QSTR_awb,        ESP_CAM_SENSOR_AWB },
+        { MP_QSTR_agc,        ESP_CAM_SENSOR_AGC },
+    };
+    mp_obj_t d = mp_obj_new_dict(4);
+    for (size_t i = 0; i < MP_ARRAY_SIZE(known); i++) {
+        esp_cam_sensor_param_desc_t desc = { .id = known[i].id };
+        if (esp_cam_sensor_query_para_desc(c->sensor, &desc) != ESP_OK) {
+            continue;
+        }
+        mp_obj_t range[3] = {
+            MP_OBJ_NEW_SMALL_INT(desc.number.minimum),
+            MP_OBJ_NEW_SMALL_INT(desc.number.maximum),
+            MP_OBJ_NEW_SMALL_INT(desc.number.step),
+        };
+        mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(known[i].q), mp_obj_new_tuple(3, range));
+    }
+    return d;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(cameraif_controls_obj, cameraif_controls);
+
 #define CAMERAIF_PARA_METHOD(pyname, id)                                     \
+    static mp_obj_t cameraif_##pyname(size_t n_args, const mp_obj_t *args,   \
+        mp_map_t *kw) {                                                      \
+        return cameraif_para(MP_OBJ_TO_PTR(args[0]), id, n_args, args, kw);  \
+    }                                                                        \
+    static MP_DEFINE_CONST_FUN_OBJ_KW(                                       \
+        cameraif_##pyname##_obj, 1, cameraif_##pyname);
+
+#define CAMERAIF_PARA_BOOL_METHOD(pyname, id)                                \
     static mp_obj_t cameraif_##pyname(size_t n_args, const mp_obj_t *args) { \
-        return cameraif_para(MP_OBJ_TO_PTR(args[0]), id, n_args, args);      \
+        return cameraif_para_bool(MP_OBJ_TO_PTR(args[0]), id, n_args, args); \
     }                                                                        \
     static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(                              \
         cameraif_##pyname##_obj, 1, 2, cameraif_##pyname);
 
 CAMERAIF_PARA_METHOD(exposure, ESP_CAM_SENSOR_EXPOSURE_VAL)
-CAMERAIF_PARA_METHOD(gain, ESP_CAM_SENSOR_GAIN)
-CAMERAIF_PARA_METHOD(flip, ESP_CAM_SENSOR_VFLIP)
-CAMERAIF_PARA_METHOD(mirror, ESP_CAM_SENSOR_HMIRROR)
+// gain() is the one control where drivers genuinely disagree about the id:
+// some implement absolute GAIN, some only analogue ANGAIN. Try both rather
+// than making the caller know which driver they got.
+static mp_obj_t cameraif_gain(size_t n_args, const mp_obj_t *args, mp_map_t *kw) {
+    cameraif_obj_t *c = MP_OBJ_TO_PTR(args[0]);
+    esp_cam_sensor_param_desc_t d = { .id = ESP_CAM_SENSOR_GAIN };
+    uint32_t id = (c->sensor
+        && esp_cam_sensor_query_para_desc(c->sensor, &d) == ESP_OK)
+        ? ESP_CAM_SENSOR_GAIN : ESP_CAM_SENSOR_ANGAIN;
+    return cameraif_para(c, id, n_args, args, kw);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(cameraif_gain_obj, 1, cameraif_gain);
+CAMERAIF_PARA_BOOL_METHOD(flip, ESP_CAM_SENSOR_VFLIP)
+CAMERAIF_PARA_BOOL_METHOD(mirror, ESP_CAM_SENSOR_HMIRROR)
 // test_pattern(on) is an ioctl rather than a parameter, so it does not fit
 // the read/write-with-range shape the others share. Worth having: the
 // sensor's own pattern proves the MIPI link independently of lens and
@@ -772,12 +1030,20 @@ static mp_obj_t cameraif_test_pattern(size_t n_args, const mp_obj_t *args) {
     if (!c->sensor) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("camera is deinited"));
     }
-    int on = (n_args >= 2) ? (mp_obj_is_true(args[1]) ? 1 : 0) : 1;
+    if (n_args < 2) {
+        // The ioctl is set-only, so this is what was last asked for rather
+        // than what the sensor reports. Said here because a reader who
+        // assumes otherwise would trust it during exactly the debugging
+        // session it was added for.
+        return mp_obj_new_bool(c->test_pattern);
+    }
+    int on = mp_obj_is_true(args[1]) ? 1 : 0;
     if (esp_cam_sensor_ioctl(c->sensor, ESP_CAM_SENSOR_IOC_S_TEST_PATTERN,
             &on) != ESP_OK) {
         mp_raise_msg(&mp_type_OSError,
             MP_ERROR_TEXT("sensor has no test pattern"));
     }
+    c->test_pattern = (on != 0);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_test_pattern_obj, 1, 2,
@@ -849,15 +1115,18 @@ static MP_DEFINE_CONST_FUN_OBJ_1(cameraif_del_obj, cameraif_del);
 static const mp_rom_map_elem_t cameraif_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_capture), MP_ROM_PTR(&cameraif_capture_obj) },
     { MP_ROM_QSTR(MP_QSTR_capture_yuy2), MP_ROM_PTR(&cameraif_capture_yuy2_obj) },
+    { MP_ROM_QSTR(MP_QSTR_capture_jpeg), MP_ROM_PTR(&cameraif_capture_jpeg_obj) },
     { MP_ROM_QSTR(MP_QSTR_size), MP_ROM_PTR(&cameraif_size_obj) },
     { MP_ROM_QSTR(MP_QSTR_sensor), MP_ROM_PTR(&cameraif_sensor_obj) },
     { MP_ROM_QSTR(MP_QSTR_formats), MP_ROM_PTR(&cameraif_formats_obj) },
+    { MP_ROM_QSTR(MP_QSTR_controls), MP_ROM_PTR(&cameraif_controls_obj) },
     { MP_ROM_QSTR(MP_QSTR_exposure), MP_ROM_PTR(&cameraif_exposure_obj) },
     { MP_ROM_QSTR(MP_QSTR_gain), MP_ROM_PTR(&cameraif_gain_obj) },
     { MP_ROM_QSTR(MP_QSTR_flip), MP_ROM_PTR(&cameraif_flip_obj) },
     { MP_ROM_QSTR(MP_QSTR_mirror), MP_ROM_PTR(&cameraif_mirror_obj) },
     { MP_ROM_QSTR(MP_QSTR_test_pattern), MP_ROM_PTR(&cameraif_test_pattern_obj) },
     { MP_ROM_QSTR(MP_QSTR_reg), MP_ROM_PTR(&cameraif_reg_obj) },
+    { MP_ROM_QSTR(MP_QSTR_frame), MP_ROM_PTR(&cameraif_frame_obj) },
     { MP_ROM_QSTR(MP_QSTR_stats), MP_ROM_PTR(&cameraif_stats_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&cameraif_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&cameraif_del_obj) },

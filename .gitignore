@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+build/
+
+# Local credentials. camera_mjpeg.py asks for a secrets.py with a Wi-Fi
+# password in it; that file belongs on the board and nowhere else.
+secrets.py
+
+# Sample captures are proof for a conversation, not repository content:
+# they are photographs of somebody real room.
+*.jpg
+*.jpeg

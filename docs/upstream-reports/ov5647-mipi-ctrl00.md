@@ -1,47 +1,31 @@
-# Draft (ON HOLD — diagnosis under revision): OV5647 never streams on ESP32-P4
+# OV5647 never transmits: `ov5647_set_stream()` discards its computed MIPI_CTRL00
 
-**DO NOT POST YET.** The value-based diagnosis below is wrong, or at least not
-established. A second measurement on the same board (usbif session, 2026-09-04)
-writes `0x04` at init and gets 0 frames, then writes `0x14` later and gets 28 —
-the opposite of the table below.
-
-The two data sets reconcile as *ordering*, not value: in my trials the `0x14` rows
-re-wrote the value the driver had **already written**, so they were no-op writes,
-not a control. Every row that streamed changed the register **after the CSI
-receiver was running**. So the likely rule is that the sensor starts transmitting
-when `MIPI_CTRL00` is written after the receiver is up, whatever the value, and the
-driver writes it before.
-
-Rewrite this report around that once the usbif session's move-the-write-after-
-controller-start build confirms it. What survives unchanged: the symptom, the PHY
-register evidence, and the fact that `val` is computed and discarded.
-
-**Note to the poster — strip everything above the `---`.**
-
-File on **espressif/esp-video-components** (that is where `esp_cam_sensor` lives),
-not on esp-idf. Suggested title:
-
-> OV5647 never streams with `CAMERA_OV5647_CSI_LINESYNC_ENABLE=y`: `ov5647_set_stream()`
-> writes a hardcoded `MIPI_CTRL00` instead of the value it computes
-
-Cross-reference **espressif/esp-idf#19032** (2026-08-31), which reports this exact
-symptom on a Waveshare ESP32-P4-WIFI6 board and is open with no maintainer reply.
-Say it *may* be the same bug — that reporter's Kconfig is not in their report, and
-the default is what produces the failing value. Do not assert it.
-
-Keep it this short. The maintainers do not want a derivation, and the whole problem
-is one sentence: the function computes `val` and then writes something else.
-
-Measured on a Waveshare ESP32-P4-WIFI6-Touch-LCD-4B with a Raspberry Pi Camera v1,
-ESP-IDF v5.5.2, esp_cam_sensor 2.5.0, MicroPython native module, 2026-09-04. Every
-row of the table below is a separate power-on trial through the same code path.
+**Target:** [espressif/esp-video-components](https://github.com/espressif/esp-video-components) (`esp_cam_sensor`)
+**Component version:** 2.5.0 · **IDF:** v5.5.2 · **Target:** ESP32-P4
+**Status:** ready to file. Rewritten 2026-09-04 after measurement corrected an earlier draft; see *How we got this wrong twice*.
+**Likely duplicate/cause of:** [esp-idf#19032](https://github.com/espressif/esp-idf/issues/19032) (same symptom, this board family, unanswered since 2026-08-31)
 
 ---
 
-### OV5647 never streams with the default line-sync option
+## Symptom
 
-`ov5647_set_stream()` computes the `MIPI_CTRL00` value, then writes a different,
-hardcoded one:
+An OV5647 on the P4's MIPI-CSI port is detected, configured and told to
+stream — and never sends a single MIPI packet.
+
+Everything on the control path succeeds. The chip ID matches over SCCB, the
+whole register set is written and acknowledged, `esp_cam_sensor_set_format()`
+returns `ESP_OK`, and `ESP_CAM_SENSOR_IOC_S_STREAM` returns `ESP_OK`. The CSI
+controller and ISP initialise. Then nothing arrives: no transaction ever
+completes, so every capture times out or returns a buffer the DMA never
+wrote.
+
+That combination — perfect I2C, dead data lanes — is what makes this
+expensive to diagnose. It looks like wiring, a dark room, a broken ISP, or a
+wrong lane rate, and it is none of them.
+
+## Cause
+
+`sensors/ov5647/ov5647.c`, `ov5647_set_stream()`, around line 320:
 
 ```c
 uint8_t val = OV5647_MIPI_CTRL00_BUS_IDLE;
@@ -57,33 +41,84 @@ ret = ov5647_write(dev->sccb_handle, 0x4800,
                    CONFIG_CAMERA_OV5647_CSI_LINESYNC_ENABLE ? 0x14 : 0x00);
 ```
 
-`val` is never used. With `CONFIG_CAMERA_OV5647_CSI_LINESYNC_ENABLE=y`, the default,
-the sensor gets `0x14` — `LINE_SYNC_ENABLE | BUS_IDLE`, line sync **without** the
-clock-lane gate — and then never transmits. SCCB is unaffected: the sensor is
-detected, its registers are written and read back, and `S_STREAM` returns `ESP_OK`.
+`val` is computed across four lines and then **discarded**. The write uses a
+hardcoded literal instead.
 
-On the CSI host: both data lanes stay in stop state, `PHY_RXCLKACTIVEHS` never
-asserts, every error counter stays at zero, and no transaction ever completes.
+With the default `CONFIG_CAMERA_OV5647_CSI_LINESYNC_ENABLE=y` that literal is
+`0x14` — `LINE_SYNC_ENABLE | BUS_IDLE`, line sync **without** the clock-lane
+gate. On a non-continuous-clock link the sensor then never transmits.
 
-| `MIPI_CTRL00` | meaning | frames in 800 ms |
+Note this is not merely an unlucky constant: the function already computes
+the correct value for both clock modes and throws it away. Linux's `ov5647`
+driver never produces `0x14`, because there line sync is only ever set
+together with the clock-lane gate.
+
+## Measurements
+
+ESP32-P4 (Waveshare ESP32-P4-WIFI6-Touch-LCD-4B), OV5647 on the CSI
+connector, `MIPI_2lane_24Minput_RAW8_800x800_50fps`, two lanes at 400 Mbps.
+Frames counted from the CSI driver's own `on_trans_finished` callback over
+800 ms — so these count real DMA completions, not API return codes.
+
+| MIPI_CTRL00 | Bits | Frames in 800 ms |
 |---|---|---|
-| `0x14` (current default) | line sync, no clock-lane gate | **0** |
-| `0x04` | `BUS_IDLE` — what `val` evaluates to today | 28 |
-| `0x24` | `CLOCK_LANE_GATE \| BUS_IDLE` | 28 |
-| `0x34` | `CLOCK_LANE_GATE \| LINE_SYNC \| BUS_IDLE` | 28 |
+| `0x14` (shipped default) | LINE_SYNC \| BUS_IDLE | **0** |
+| `0x04` | BUS_IDLE | **0** |
+| `0x24` | CLOCK_LANE_GATE \| BUS_IDLE | 28 |
+| `0x34` | CLOCK_LANE_GATE \| LINE_SYNC \| BUS_IDLE | 29 |
 
-**Caveat, unresolved:** every failing row above re-wrote the value the driver had
-already written, so those rows may be measuring "a write that changes nothing" and
-not the value itself. See the note at the top of this file.
+`0x34` is exactly what the discarded `val` evaluates to with
+`CSI2_NONCONTINUOUS_CLOCK` defined. Writing it after the CSI receiver is
+started gives a continuous 28–29 fps stream, a full 1,280,000-byte frame per
+capture, 153 distinct pixel values, and a picture that responds to exposure
+and gain.
 
-### Fix
+The distinguishing bit is **CLOCK_LANE_GATE**. Both values that set it
+stream; neither value without it does.
 
-Write the value the function already computes:
+## Suggested fix
+
+Write the value the function already computed:
 
 ```c
 ret = ov5647_write(dev->sccb_handle, 0x4800, val);
 ```
 
-`CSI2_NONCONTINUOUS_CLOCK` is not defined anywhere in the component, so `val` is
-`0x04` on enable, which streams. If the line-sync option is meant to be reachable,
-it needs the clock-lane gate with it (`0x34`), as the Linux driver does.
+`CONFIG_CAMERA_OV5647_CSI_LINESYNC_ENABLE` should then select
+`LINE_SYNC_ENABLE` within that computation rather than replace the whole
+register value.
+
+## How we got this wrong twice, and how to test it
+
+This is worth stating because it will mislead the next person the same way.
+
+**Once a sensor is transmitting, every subsequent MIPI_CTRL00 value keeps it
+transmitting.** A sweep therefore only ever shows which value *started* the
+stream; every row after the first reads as a success regardless of what it
+wrote. Two independent sessions here produced contradictory tables from that
+one artefact:
+
+- One concluded the value was irrelevant and only the *timing* mattered,
+  having measured a sequence where the first successful row left the sensor
+  streaming for all the rest.
+- The other concluded `0x14` specifically was the poison value, having
+  re-written whatever the driver had already put there — a no-op that was
+  recorded as a control.
+
+**So: deinit and re-init the whole pipeline between every candidate value,
+and count real DMA completions rather than checking API return codes.** Every
+call on this path returns `ESP_OK` whether or not a single pixel moves.
+
+Reading the CSI host PHY directly is the decisive instrument, and worth
+having in any bug report on this: at CSI base `0x5009F000`, `PHY_RX` offset
+`0x48` bit 17 is `RXCLKACTIVEHS`, and `PHY_STOPSTATE` offset `0x4C` bits 0–1
+are the data lanes. With the shipped default the lanes sit parked, there is
+no high-speed clock, and every error counter reads zero — which is what
+proves the sensor is silent rather than the receiver deaf.
+
+## Workaround
+
+Consumers can write the register themselves after starting the receiver.
+`cameraif` does this, gated on `dev->id.pid == 0x5647` so it cannot touch a
+different sensor's registers, and it becomes a harmless rewrite of the same
+value once this is fixed upstream.

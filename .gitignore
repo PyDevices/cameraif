@@ -7,6 +7,7 @@ build/
 secrets.py
 
 # Sample captures are proof for a conversation, not repository content:
-# they are photographs of somebody real room.
+# they are photographs of somebody's actual room.
 *.jpg
 *.jpeg
+*.png

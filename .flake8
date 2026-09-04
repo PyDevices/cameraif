@@ -1,0 +1,11 @@
+[flake8]
+# Defect checks only, no formatting opinions -- the house style, matching
+# the sibling *if modules.
+select = E9,F63,F7,F82,F401,F811,F841
+max-line-length = 100
+# Names MicroPython provides that CPython does not: viper's pointer types and
+# the freeze manifest's vocabulary. Without these, real F821 checking has to
+# be switched off wholesale to keep the run green -- which would also stop it
+# catching genuine undefined names.
+builtins = ptr8,ptr16,ptr32,package,module,freeze,freeze_as_mpy,freeze_as_str,include,require,options
+exclude = .git,__pycache__

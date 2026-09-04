@@ -1,7 +1,8 @@
 # OV5647 never transmits: `ov5647_set_stream()` discards its computed MIPI_CTRL00
 
 **Target:** [espressif/esp-video-components](https://github.com/espressif/esp-video-components) (`esp_cam_sensor` 2.5.0)
-**Status:** ready to file. Post only what is below the `---`.
+**Status:** FILED 2026-09-04 as https://github.com/espressif/esp-video-components/issues/97
+(posted as the text below the `---`, plus a one-line environment header).
 
 Kept out of the post on purpose. A one-line mistake does not need a book, and
 maintainers have said so in other projects: prune it, or write it the way a

@@ -264,11 +264,20 @@ that no longer exists.
 | [`camera_snapshot.py`](examples/camera_snapshot.py) | A still to the filesystem as hardware-encoded JPEG |
 | [`camera_mjpeg.py`](examples/camera_mjpeg.py) | An MJPEG server any browser can open |
 | [`camera_still.py`](examples/camera_still.py) | Live view, BOOT button takes the picture. The one that feels like a camera |
+
 | [`camera_controls.py`](examples/camera_controls.py) | Discovering what a sensor supports, then sweeping it on screen |
 
 The examples take the camera from `board_config`, so they run unchanged on
 any board whose config provides one. On a board without one, construct a
 `Camera` directly with your own pins.
+
+One caution, measured on the ESP32-P4 and written up in `camera_still.py`:
+constructing an `appdev.App` alongside a continuous full-frame preview drops
+it from 18.7 fps to 2.0 and then trips the interrupt watchdog. A camera
+preview keeps the sensor, the scaler and the panel all moving data through
+PSRAM at once, which is an unusual load for a 10 ms service timer to sit on
+top of. None of these examples use a scheduler; for anything that is not a
+continuous video loop, reach for `appdev` first.
 
 ## Performance, measured
 

@@ -3,56 +3,58 @@
     mpremote run camera_still.py
 
 Point it at something, press the BOOT button, and a JPEG appears on the
-board's filesystem. Press it again for another. Fetch them with::
+board's filesystem. Press again for another. Fetch them with::
 
     mpremote ls
     mpremote cp :photo_001.jpg .
 
-**How the button gets here.** `board_config` publishes the BOOT button
-through `keypad_read`, and `appdev` turns that into ordinary KEYDOWN events
--- the same events a USB keyboard would produce. Nothing in this file knows
-which GPIO it is or that it is active-low, which is why the same file works
-on a board that wires its shutter somewhere else entirely.
+**How the button gets here.** `board_config` publishes the BOOT button as
+`keypad_read()`, which returns the key codes currently held. Nothing in this
+file knows which GPIO it is or that it is active-low, so the same file works
+on a board that wires its shutter somewhere else. The press is an edge --
+held now, not held last time -- because a button read every 50 ms is held
+down across many reads and a level would fire the shutter continuously.
 
-**On the shape of this file.** `appdev` is the scheduler. It polls the input
-devices, dispatches the events, and keeps the program alive after the last
-line runs -- so there is no `while True` here and no `app.run()` at the
-bottom. The preview is on `app.every()` because repainting is genuinely
-periodic work of our own; the shutter is on `app.on()` because it happens
-when it happens. Anything drawn must be followed by `display_drv.show()`,
-which is what actually puts the back buffer on the glass.
+**Why there is no `appdev.App` here, and when you should still use one.**
+`appdev` is the right home for most applications: it owns the scheduler,
+polls the input devices, dispatches events, and calls `show()`. Use it. This
+program is the exception, and the reason is measured rather than assumed --
+on this board, the identical preview loop runs at:
 
-**Stopping it.** Ctrl-C will not: `appdev` drives this from a hardware timer,
-and interrupting the callback leaves the timer armed to fire the next one.
-Press the board's reset button, or::
+    18.7 fps   plain loop, board_config.keypad_read() read directly
+     2.0 fps   the same loop with an appdev.App constructed
 
-    python -m esptool --chip esp32p4 --port COMn --after hard_reset chip-id
+and the App version then trips the interrupt watchdog and resets the board.
+Nine times slower is not a tuning problem, so this example does the simple
+thing that works. A camera preview is an unusual load -- it saturates the
+memory bus with DMA from the sensor, the scaler and the panel at once -- and
+that appears to be what the App's 10 ms service timer collides with. If you
+are writing something that is not a continuous full-frame video loop, reach
+for `appdev` first.
+
+**Stopping it.** Ctrl-C works, because the loop is ours.
 """
 
-import appdev
 import board_config
 from board_config import display_drv as display
 
 QUALITY = 90
-PREVIEW_MS = 30
 
-app = appdev.App(board_config)
 cam = board_config.camera
 
-# The panel's own scanout buffer. capture_scaled() scales the frame into it
-# with the PPA, by DMA, so the live view costs the CPU one call per frame.
+# The panel's scanout buffer. capture_scaled() scales the camera frame into
+# it with the PPA, by DMA, so the live view costs the CPU one call per frame.
 framebuffer = display.framebuffers()[0]
 
 count = 0
-busy = False
 
 
 def next_filename():
     """First unused photo_NNN.jpg.
 
     Deliberately not a counter starting at 1 each run: a board that reboots
-    would silently overwrite yesterday's pictures, and the failure would only
-    surface when someone went looking for one.
+    would silently overwrite yesterday's pictures, and that failure only
+    surfaces when someone goes looking for one.
     """
     import os
 
@@ -66,34 +68,24 @@ def next_filename():
     return "photo_%03d.jpg" % n
 
 
-def draw_preview(_=None):
-    global busy
-    if busy:
-        return              # never paint over a shot being taken
-    if cam.capture_scaled(framebuffer, display.width, display.height,
-                          timeout=200) is None:
-        return
+def take_photo():
+    global count
+    # A white frame, before the capture rather than after: it is the only
+    # feedback there is on a board with no shutter sound, and it should mark
+    # the moment the picture was taken.
+    display.fill(0xFFFF)
     display.show()
-
-
-def shutter(_event):
-    global count, busy
-    busy = True
     try:
-        # A white frame, before the capture rather than after: it is the only
-        # feedback there is on a board with no shutter sound, and it should
-        # mark the moment the picture was taken.
-        display.fill(0xFFFF)
-        display.show()
-
         img = cam.capture_jpeg(QUALITY)
         if img is None:
             print("shutter: no frame")
             return
+        # A truncated encode still returns bytes. A file that is the right
+        # size but has no end-of-image marker fails much later, on somebody
+        # else's computer.
         if img[:2] != b"\xff\xd8" or img[-2:] != b"\xff\xd9":
             print("shutter: encoder returned %d bytes that are not a JPEG" % len(img))
             return
-
         name = next_filename()
         with open(name, "wb") as f:
             f.write(img)
@@ -101,10 +93,28 @@ def shutter(_event):
         print("%s  %d bytes  (%d this session)" % (name, len(img), count))
     finally:
         display.fill(0)
-        busy = False
 
 
-app.on(app.events.KEYDOWN, shutter)
-app.every(PREVIEW_MS, draw_preview)
+def main():
+    print("Live view up. Press BOOT to take a picture.")
+    held = set()
+    try:
+        while True:
+            now = set(board_config.keypad_read() or ())
+            pressed = now - held      # the edge, not the level
+            held = now
+            if pressed:
+                take_photo()
+            elif cam.capture_scaled(framebuffer, display.width, display.height,
+                                    timeout=200) is not None:
+                # Required: the panel only shows a buffer after show()
+                # promotes it.
+                display.show()
+    except KeyboardInterrupt:
+        print("stopped after %d picture%s" % (count, "" if count == 1 else "s"))
+    finally:
+        cam.deinit()
 
-print("Live view up. Press BOOT to take a picture.")
+
+if __name__ == "__main__":
+    main()

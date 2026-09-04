@@ -1,4 +1,20 @@
-# Draft: OV5647 never streams on ESP32-P4 because `ov5647_set_stream()` discards the value it computes
+# Draft (ON HOLD — diagnosis under revision): OV5647 never streams on ESP32-P4
+
+**DO NOT POST YET.** The value-based diagnosis below is wrong, or at least not
+established. A second measurement on the same board (usbif session, 2026-09-04)
+writes `0x04` at init and gets 0 frames, then writes `0x14` later and gets 28 —
+the opposite of the table below.
+
+The two data sets reconcile as *ordering*, not value: in my trials the `0x14` rows
+re-wrote the value the driver had **already written**, so they were no-op writes,
+not a control. Every row that streamed changed the register **after the CSI
+receiver was running**. So the likely rule is that the sensor starts transmitting
+when `MIPI_CTRL00` is written after the receiver is up, whatever the value, and the
+driver writes it before.
+
+Rewrite this report around that once the usbif session's move-the-write-after-
+controller-start build confirms it. What survives unchanged: the symptom, the PHY
+register evidence, and the fact that `val` is computed and discarded.
 
 **Note to the poster — strip everything above the `---`.**
 
@@ -56,9 +72,9 @@ asserts, every error counter stays at zero, and no transaction ever completes.
 | `0x24` | `CLOCK_LANE_GATE \| BUS_IDLE` | 28 |
 | `0x34` | `CLOCK_LANE_GATE \| LINE_SYNC \| BUS_IDLE` | 28 |
 
-`0x14` is the one combination that fails, and it is the only one Linux's ov5647
-driver never produces: there, `LINE_SYNC_ENABLE` is only ever set together with
-`CLOCK_LANE_GATE` (`drivers/media/i2c/ov5647.c`, `ov5647_stream_on`).
+**Caveat, unresolved:** every failing row above re-wrote the value the driver had
+already written, so those rows may be measuring "a write that changes nothing" and
+not the value itself. See the note at the top of this file.
 
 ### Fix
 

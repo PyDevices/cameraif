@@ -285,16 +285,25 @@ that no longer exists.
 | [`camera_snapshot.py`](examples/camera_snapshot.py) | A still to the filesystem as hardware-encoded JPEG |
 | [`camera_mjpeg.py`](examples/camera_mjpeg.py) | An MJPEG server any browser can open |
 | [`camera_still.py`](examples/camera_still.py) | Live view, BOOT button takes the picture. The one that feels like a camera |
-
 | [`camera_controls.py`](examples/camera_controls.py) | Discovering what a sensor supports, then sweeping it on screen |
+| [`camera_frame.py`](examples/camera_frame.py) | Zero-copy `frame()` loop with `stats()` |
+| [`camera_transform.py`](examples/camera_transform.py) | `capture_scaled` with rotate, mirror, and a cropped inset |
+| [`camera_formats.py`](examples/camera_formats.py) | List `formats()`, then construct `Camera(...)` with a named format |
+| [`camera_diag.py`](examples/camera_diag.py) | Bring-up: stats, test pattern, optional `reg()` |
 
 The examples take the camera from `board_config`, so they run unchanged on
 any board whose config provides one. On a board without one, construct a
-`Camera` directly with your own pins.
+`Camera` directly with your own pins -- see `camera_formats.py`.
 
 `camera_still.py` is the one that uses `appdev` as the scheduler, which is
 the house idiom for an application with input; the rest are plain scripts
 because they have nothing to schedule.
+
+USB webcam (the board presenting as UVC) lives in
+[`usbif`](https://github.com/PyDevices/usbif)'s `examples/usbif_webcam.py`,
+which sources frames from this module when a camera is present.
+
+Known hole: [`available()` always returns True](https://github.com/PyDevices/cameraif/issues/1).
 
 ## Performance, measured
 

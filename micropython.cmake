@@ -22,12 +22,20 @@ target_include_directories(usermod_cameraif INTERFACE
 # usermod is an INTERFACE library added to `main`, so it only sees what main
 # already required -- esp_driver_cam and esp_driver_jpeg are not in that set,
 # and without these the headers are simply not on the include path.
-target_link_libraries(usermod_cameraif INTERFACE
-    idf::esp_driver_cam
-    idf::esp_driver_isp
-    idf::esp_driver_jpeg
-    idf::esp_driver_ppa
-)
+#
+# Only on ESP-IDF, though. The header comment above promises this module builds
+# on rp2 and unix with mod_cameraif.c's bodies guarded, but linking idf::
+# targets unconditionally broke that promise: on an rp2 build CMake fails
+# outright because those targets do not exist, taking the whole firmware with
+# it. Found building for a Pico.
+if(ESP_PLATFORM)
+    target_link_libraries(usermod_cameraif INTERFACE
+        idf::esp_driver_cam
+        idf::esp_driver_isp
+        idf::esp_driver_jpeg
+        idf::esp_driver_ppa
+    )
+endif()
 
 # Note there is deliberately no `-u ov5647_detect` here.
 #

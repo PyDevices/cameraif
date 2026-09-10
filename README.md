@@ -319,32 +319,11 @@ On an ESP32-P4 with an OV5647 at 800x800 RGB565:
 | MJPEG over Wi-Fi, quality 40 | 15 fps | the network |
 | MJPEG over Wi-Fi, quality 70 | 7 fps | the network |
 
-Everything except the panel refresh now runs at the rate the sensor
-delivers. Two things got it there.
-
-**The PPA does the scaling.** `capture_scaled()` hands the frame to the
-Pixel Processing Accelerator, which reads the camera buffer and writes the
-panel's scanout buffer by DMA. The row-at-a-time version it replaced was 720
-blit calls per frame and ran at 4.7 fps.
-
-**And a 97 ms wait that should not have existed.** Every capture was calling
-`esp_cam_ctlr_receive()` to hand the driver a buffer. But `esp_cam_ctlr_csi`
-reads its transaction queue only in the `else` branch of `if
-(ctlr->cbs.on_get_new_trans)` — and this module must register that callback,
-because it is how the driver is told which of the two buffers Python is not
-holding. So the queue was filled once and never drained again, and every
-subsequent `receive()` blocked for its whole timeout. The camera was
-delivering a frame every 28 ms and this module was collecting one every
-130 ms.
-
-It presented as a slow camera, which is the most expensive kind of bug to
-have: everything worked, so there was nothing to debug. It was found by
-measuring the parts separately instead of trusting a guess about which part
-was slow — the first guess, that the cache invalidate dominated, was wrong
-by a factor of fourteen.
-
-`capture_jpeg()` matching the sensor rate is not a rounding artefact: the
-hardware encoder genuinely costs less than the 28 ms between frames.
+Everything except the panel refresh runs at the rate the sensor delivers, and
+`capture_jpeg()` matching it is not a rounding artefact — the hardware encoder
+genuinely costs less than the 28 ms between frames. Two changes got it there, a
+DMA scaler and a 97 ms wait that should not have existed:
+[how it got there](docs/performance.md).
 
 ## Known hardware defect
 
@@ -352,12 +331,10 @@ The OV5647's `MIPI_CTRL00` register (0x4800) comes up with clock-lane gating
 enabled, and the sensor then produces nothing over MIPI. `cameraif` writes
 `0x34` to it for this sensor specifically, gated on its product ID.
 
-The distinguishing bit is `CLOCK_LANE_GATE`, established by measurement
-rather than assumption: `0x04` and `0x14` both fail, `0x34` works, and each
-trial was run with a full teardown in between so no trial inherited the
-previous one's state. Written up in
-[`docs/upstream-reports/ov5647-mipi-ctrl00.md`](docs/upstream-reports/ov5647-mipi-ctrl00.md)
-and filed upstream as
+The distinguishing bit is `CLOCK_LANE_GATE`. How that was established, and the
+measurement trap that makes a naive sweep lie about it, are in the report:
+[`docs/upstream-reports/ov5647-mipi-ctrl00.md`](docs/upstream-reports/ov5647-mipi-ctrl00.md),
+filed upstream as
 [esp-video-components#97](https://github.com/espressif/esp-video-components/issues/97).
 
 ## Licence

@@ -1321,8 +1321,26 @@ static MP_DEFINE_CONST_OBJ_TYPE(
     locals_dict, &cameraif_locals_dict
 );
 
+// A probe that cannot fail is not a probe. Reaching this branch already means
+// the firmware was built for a target with a MIPI-CSI controller, so what is
+// left to ask is whether any sensor driver was linked into it: esp_cam_sensor
+// drivers register themselves in the detect section walked by the open path
+// above, and with no CONFIG_CAMERA_<chip> (plus its AUTO_DETECT option) the
+// section is empty and no camera can ever be found on a perfectly good bus.
+//
+// That is not hypothetical. It is exactly the state a P4 build lands in when
+// the option is missed, and this module then reports it as "no camera sensor
+// answered on SCCB" -- a wiring-shaped error for a build-configuration cause,
+// which is the confusion micropython.cmake's note was written about and which
+// this function exists to end.
+//
+// It deliberately does NOT touch the bus. available() is asked before any pins
+// are known -- board_peripherals calls it before it passes sda/scl -- so it
+// could not probe honestly even if it wanted to, and "is a sensor plugged in"
+// is already answered, with a message, by constructing a Camera.
 static mp_obj_t cameraif_available(void) {
-    return mp_const_true;
+    return mp_obj_new_bool(&__esp_cam_sensor_detect_fn_array_start
+        < &__esp_cam_sensor_detect_fn_array_end);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(cameraif_available_obj, cameraif_available);
 

@@ -303,7 +303,11 @@ USB webcam (the board presenting as UVC) lives in
 [`usbif`](https://github.com/PyDevices/usbif)'s `examples/usbif_webcam.py`,
 which sources frames from this module when a camera is present.
 
-Known hole: [`available()` always returns True](https://github.com/PyDevices/cameraif/issues/1).
+`available()` answers whether this firmware can open a camera at all: it is
+true when at least one `esp_cam_sensor` driver was linked in, and false on a
+build with no `CONFIG_CAMERA_<chip>` enabled and on every non-P4 target. It
+does not say whether a sensor is plugged in -- that is what constructing a
+`Camera` tells you, with a message.
 
 ## Performance, measured
 

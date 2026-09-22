@@ -7,5 +7,5 @@ max-line-length = 100
 # the freeze manifest's vocabulary. Without these, real F821 checking has to
 # be switched off wholesale to keep the run green -- which would also stop it
 # catching genuine undefined names.
-builtins = ptr8,ptr16,ptr32,package,module,freeze,freeze_as_mpy,freeze_as_str,include,require,options
+builtins = ptr8,ptr16,ptr32,package,module,freeze,freeze_as_mpy,freeze_as_str,include,require,options,c_module
 exclude = .git,__pycache__

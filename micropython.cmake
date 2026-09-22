@@ -51,3 +51,16 @@ endif()
 # matter; they live in the cameraif patch.
 
 target_link_libraries(usermod INTERFACE usermod_cameraif)
+
+# --- which cameraif this firmware was built from ----------------------
+# Computed at build time from this repo's own git, never stored; "unknown" when
+# there is no git (a tarball). Read on a target as <module>.__revision__.
+execute_process(
+    COMMAND git -C ${CAMERAIF_MOD_DIR} describe --always --dirty --abbrev=7
+    OUTPUT_VARIABLE CAMERAIF_REVISION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT CAMERAIF_REVISION)
+    set(CAMERAIF_REVISION "unknown")
+endif()
+target_compile_definitions(usermod_cameraif INTERFACE CAMERAIF_REVISION=\"${CAMERAIF_REVISION}\")

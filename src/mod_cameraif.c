@@ -29,6 +29,7 @@
 
 #include "py/runtime.h"
 #include "py/obj.h"
+#include "py/objstr.h"
 #include "py/mphal.h"
 #include "py/objarray.h"
 
@@ -1370,8 +1371,18 @@ static MP_DEFINE_CONST_FUN_OBJ_0(cameraif_available_obj, cameraif_available);
 
 #endif
 
+
+// cameraif.__revision__: which cameraif this firmware was built from. The build
+// passes CAMERAIF_REVISION (git describe) as a compile definition; a build with no
+// git says "unknown" rather than guessing.
+#ifndef CAMERAIF_REVISION
+#define CAMERAIF_REVISION "unknown"
+#endif
+static const MP_DEFINE_STR_OBJ(cameraif_revision_obj, CAMERAIF_REVISION);
+
 static const mp_rom_map_elem_t cameraif_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_cameraif) },
+    { MP_ROM_QSTR(MP_QSTR___revision__), MP_ROM_PTR(&cameraif_revision_obj) },
     { MP_ROM_QSTR(MP_QSTR_Camera), MP_ROM_PTR(&cameraif_camera_type) },
     { MP_ROM_QSTR(MP_QSTR_available), MP_ROM_PTR(&cameraif_available_obj) },
 };

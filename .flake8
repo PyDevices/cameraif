@@ -7,5 +7,11 @@ max-line-length = 100
 # the freeze manifest's vocabulary. Without these, real F821 checking has to
 # be switched off wholesale to keep the run green -- which would also stop it
 # catching genuine undefined names.
-builtins = ptr8,ptr16,ptr32,package,module,freeze,freeze_as_mpy,freeze_as_str,include,require,options,c_module
+# manifest.py is run by MicroPython's makemanifest.py, which injects
+# c_module(), include(), require() and friends as globals. flake8's
+# `builtins` option would name them, but flake8 7.4.0 + pyflakes 4.0.0
+# crash on that option, so the undefined-name check is switched off for
+# that one file instead.
+per-file-ignores =
+    manifest.py:F821
 exclude = .git,__pycache__

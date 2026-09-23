@@ -43,9 +43,12 @@ difference between a working camera and a plausible-looking failure:
 
 ## Install
 
-`cameraif` is a user C module. Add it to a MicroPython ESP32-P4 build:
+`cameraif` is a user C module. The esp32 port needs two small patches
+first (the sensor-driver component and its sdkconfig, see
+[patches/](patches/)), then add the module to a MicroPython ESP32-P4 build:
 
 ```bash
+/path/to/cameraif/apply_patches.sh --apply /path/to/micropython
 make USER_C_MODULES=/path/to/cameraif/micropython.cmake BOARD=ESP32_GENERIC_P4
 ```
 
@@ -108,9 +111,16 @@ looked like a scheduler problem two layers away.
 Two things guard it now. `cameraif` refuses to open a second master on pins
 another driver has reserved, naming the port to pass instead. And
 `machine.I2C` on the ESP32-P4 is built on esp-idf's new `i2c_master` driver
-(`cmods/patches/cameraif-02-…`), because the legacy driver it used before
-cannot hand out a bus handle to share and does not reserve its pins, so
-neither the sharing nor the check was possible.
+([patches/0002](patches/0002-micropython-esp32-p4-camera-sensor-sdkconfig.patch)),
+because the legacy driver it used before cannot hand out a bus handle to
+share and does not reserve its pins, so neither the sharing nor the check
+was possible.
+
+Those patches, and the one that adds the sensor-driver component to the
+esp32 port, live in [patches/](patches/) with the module that needs them.
+`./apply_patches.sh --apply [MP_DIR]` puts them on a MicroPython checkout
+(`--status` and `--revert` too); the checkout defaults to `micropython`
+beside this repository.
 
 ### Getting frames
 

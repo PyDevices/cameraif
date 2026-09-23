@@ -2,6 +2,9 @@
 
 A MIPI-CSI camera as a MicroPython object, on the ESP32-P4.
 
+New here? Read the [newcomer's guide](docs/newcomers.md) for the sensor-to-
+framebuffer path, firmware boundary, and capture ownership rules.
+
 ```python
 import cameraif
 

@@ -46,16 +46,39 @@ difference between a working camera and a plausible-looking failure:
 
 ## Install
 
-`cameraif` is a user C module. The esp32 port needs two small patches
-first (the sensor-driver component and its sdkconfig, see
-[patches/](patches/)), then add the module to a MicroPython ESP32-P4 build:
+`cameraif` is a user C module for the ESP32-P4; every line of it is MIPI-CSI
+hardware. On rp2 it still builds, with its bodies stubbed and `available()`
+answering `False`; Make ports such as unix have no build glue for it at all.
+
+The esp32 port needs two small patches first: the sensor-driver component and
+its sdkconfig (see [patches/](patches/); both apply cleanly to MicroPython
+v1.29.0). Point the script at your own MicroPython tree:
 
 ```bash
 /path/to/cameraif/apply_patches.sh --apply /path/to/micropython
+```
+
+Then, on MicroPython 1.29 or later, add one line to the manifest your P4 build
+already uses (usually `ports/esp32/boards/manifest.py`, unless your board
+brings its own):
+
+```python
+include("/path/to/cameraif/manifest.py")
+```
+
+The manifest freezes nothing; it only names the C module. If you would rather
+pass a manifest of your own as `FROZEN_MANIFEST=`, it replaces the port's
+default, so give it `include("$(PORT_DIR)/boards/manifest.py")` as well or you
+lose `asyncio` and the port's other frozen modules.
+
+On MicroPython older than 1.29, manifests have no `c_module()`; use the
+`USER_C_MODULES` flag instead:
+
+```bash
 make USER_C_MODULES=/path/to/cameraif/micropython.cmake BOARD=ESP32_GENERIC_P4
 ```
 
-and enable a sensor driver in the board's sdkconfig — for the OV5647:
+Either way, enable a sensor driver in the board's sdkconfig — for the OV5647:
 
 ```
 CONFIG_CAMERA_OV5647=y

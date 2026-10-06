@@ -56,7 +56,6 @@
 #include "driver/i2c_master.h"
 #include "esp_private/esp_gpio_reserve.h"
 #include "driver/isp.h"
-#include "driver/jpeg_encode.h"
 #include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -67,6 +66,15 @@
 // deinit() remains the working path.
 extern void displayif_register_soft_reset(void (*fn)(void)) __attribute__((weak));
 extern void displayif_unregister_soft_reset(void (*fn)(void)) __attribute__((weak));
+
+// jpegio does the JPEG encoding (on the P4's hardware engine), from its C API
+// (jpegio.h in micropython-pydevices' modules/jpegio). Weak for the same
+// reason: a firmware without jpegio still links, and capture_jpeg() says what
+// is missing. Its arguments: pixels, len, width, height, stride, format (0 =
+// RGB565), swap, quality, subsample (4:2:0), hardware (-1 = when there is
+// one), exact, used_hw.
+extern mp_obj_t jpegio_encode(const void *pixels, size_t len, int width, int height, size_t stride,
+    int format, bool swap, int quality, bool subsample, int hardware, bool exact, bool *used_hw) __attribute__((weak));
 
 #define CAMERAIF_OV5647_PID (0x5647)
 
@@ -90,10 +98,7 @@ typedef struct {
     bool test_pattern;           // last requested; the ioctl has no read side
     esp_cam_ctlr_handle_t cam;
     isp_proc_handle_t isp;
-    jpeg_encoder_handle_t jpeg;
     ppa_client_handle_t ppa;
-    uint8_t *jpeg_buf;
-    size_t jpeg_buf_size;
     esp_ldo_channel_handle_t ldo;
     i2c_master_bus_handle_t i2c;
     bool owns_i2c;              // false when we joined machine.I2C's bus
@@ -205,18 +210,9 @@ static void cameraif_teardown(void) {
         esp_isp_del_processor(c->isp);
         c->isp = NULL;
     }
-    if (c->jpeg) {
-        jpeg_del_encoder_engine(c->jpeg);
-        c->jpeg = NULL;
-    }
     if (c->ppa) {
         ppa_unregister_client(c->ppa);
         c->ppa = NULL;
-    }
-    if (c->jpeg_buf) {
-        heap_caps_free(c->jpeg_buf);
-        c->jpeg_buf = NULL;
-        c->jpeg_buf_size = 0;
     }
     if (c->sensor) {
         int off = 0;
@@ -802,17 +798,22 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_yuy2_obj, 4, 5,
 
 // capture_jpeg(quality=80, timeout=1000) -> bytes
 //
-// Uses the P4's hardware JPEG encoder, which takes RGB565 directly -- the
-// same thing the ISP already produces, so a frame goes sensor -> ISP ->
-// encoder with no software conversion anywhere.
+// Encoded by jpegio, which on the P4 hands the frame to the hardware JPEG
+// encoder. The encoder takes RGB565 directly -- the same thing the ISP already
+// produces -- and the frame buffer is already DMA memory, so a frame goes
+// sensor -> ISP -> encoder with no software conversion or copy anywhere.
+// That is jpegio's exact=false: the engine widens RGB565 by zero-filling,
+// which costs a camera frame nothing visible, where widening every pixel in
+// software first would cost most of the frame rate.
 //
 // This is what makes MJPEG practical on this board. A UVC device advertising
 // uncompressed YUY2 is limited by bus bandwidth to small frames; the same
 // bus carries 800x800 comfortably once each frame is a JPEG a tenth the
 // size. It is also what a still is usually wanted as.
 //
-// The encoder and its output buffer are created on first use and freed by
-// teardown, so a program that never asks for JPEG pays nothing for it.
+// jpegio keeps the engine and its output buffer between calls, so a program
+// that never asks for JPEG pays nothing for it, and one that streams
+// allocates once.
 static mp_obj_t cameraif_capture_jpeg(size_t n_args, const mp_obj_t *args) {
     cameraif_obj_t *c = MP_OBJ_TO_PTR(args[0]);
     mp_int_t quality = (n_args > 1) ? mp_obj_get_int(args[1]) : 80;
@@ -825,43 +826,15 @@ static mp_obj_t cameraif_capture_jpeg(size_t n_args, const mp_obj_t *args) {
     if (quality < 1 || quality > 100) {
         mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("quality is 1..100"));
     }
-    if (c->jpeg == NULL) {
-        jpeg_encode_engine_cfg_t eng = { .timeout_ms = 200 };
-        if (jpeg_new_encoder_engine(&eng, &c->jpeg) != ESP_OK) {
-            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no JPEG encoder"));
-        }
-        // Generous: a JPEG is far smaller than its source, but a
-        // high-quality encode of a noisy frame is not as small as one
-        // expects, and an output buffer that is merely usually big enough
-        // fails on exactly the frames worth keeping.
-        jpeg_encode_memory_alloc_cfg_t mcfg = {
-            .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER,
-        };
-        size_t got = 0;
-        c->jpeg_buf = jpeg_alloc_encoder_mem(c->frame_bytes / 2, &mcfg, &got);
-        if (c->jpeg_buf == NULL) {
-            jpeg_del_encoder_engine(c->jpeg);
-            c->jpeg = NULL;
-            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("JPEG buffer"));
-        }
-        c->jpeg_buf_size = got;
+    if (jpegio_encode == NULL) {
+        mp_raise_msg(&mp_type_OSError,
+            MP_ERROR_TEXT("capture_jpeg needs the jpegio module in this firmware"));
     }
     if (!cameraif_wait_frame(c, timeout, false)) {
         return mp_const_none;
     }
-    jpeg_encode_cfg_t cfg = {
-        .width = c->width,
-        .height = c->height,
-        .src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
-        .sub_sample = JPEG_DOWN_SAMPLING_YUV420,
-        .image_quality = (uint32_t)quality,
-    };
-    uint32_t out_len = 0;
-    if (jpeg_encoder_process(c->jpeg, &cfg, c->frame, c->frame_bytes,
-            c->jpeg_buf, c->jpeg_buf_size, &out_len) != ESP_OK) {
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("JPEG encode failed"));
-    }
-    return mp_obj_new_bytes(c->jpeg_buf, out_len);
+    return jpegio_encode(c->frame, c->frame_bytes, c->width, c->height,
+        (size_t)c->width * 2, 0, false, (int)quality, true, -1, false, NULL);
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_jpeg_obj, 1, 3,
     cameraif_capture_jpeg);

@@ -197,9 +197,13 @@ conversion in Python is not viable.
 
 **`capture_jpeg(quality=80, timeout=1000)` → `bytes` | `None`**
 
-JPEG, encoded by the P4's hardware encoder. The sensor's RGB565 goes to the
+JPEG, encoded by the P4's hardware encoder through
+[jpegio](https://github.com/PyDevices/micropython-pydevices/tree/main/modules/jpegio),
+so the firmware needs jpegio too (`--modules cameraif,jpegio`, or `all`);
+without it this raises `OSError` and says so. The sensor's RGB565 goes to the
 encoder untouched, so there is no software colour conversion in the path at
-all. Measured on a normally-lit room at 800x800, against 1.28 MB raw:
+all. To encode any other RGB565 buffer the same way, use
+`jpegio.JpegEncoder` directly. Measured on a normally-lit room at 800x800, against 1.28 MB raw:
 
 | quality | size | ratio |
 |---|---|---|

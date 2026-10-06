@@ -1,0 +1,12 @@
+# cameraif on the ESP32-P4: the OV5647 driver (the Waveshare panel's MIPI-CSI
+# camera), appended to every P4 build that selects cameraif.
+#
+# Two options, needed together, failing differently when absent. Without
+# CONFIG_CAMERA_OV5647 the driver is not compiled. Without the AUTO_DETECT
+# option it is compiled but its probe is dropped by --gc-sections, because
+# esp_cam_sensor's detection walks a linker section rather than calling a
+# symbol. Either way the detect array is empty and the camera reports as
+# absent on the bus -- a wiring-shaped error with a build-configuration
+# cause, which cost an hour to see because the message names SCCB.
+CONFIG_CAMERA_OV5647=y
+CONFIG_CAMERA_OV5647_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y

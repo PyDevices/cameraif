@@ -169,8 +169,11 @@ where making the caller size 1.28 MB first is a poor introduction.
 **`capture_scaled(dst, pic_w, pic_h, *, x=0, y=0, w=None, h=None, rotate=0, mirror=False, timeout=1000)`**
 
 Scale the frame into a rectangle of a destination picture, using the P4's
-Pixel Processing Accelerator. No pixel passes through the CPU: the PPA reads
-the camera buffer and writes the destination by DMA.
+Pixel Processing Accelerator through
+[ppa](https://github.com/PyDevices/micropython-pydevices/tree/main/modules/ppa),
+so the firmware needs ppa too (`--modules cameraif,ppa`, or `all`). No pixel
+passes through the CPU: the PPA reads the camera buffer and writes the
+destination by DMA.
 
 ```python
 fb = display_drv.framebuffers()[0]
@@ -185,15 +188,19 @@ hardware operation. `rotate` takes 0, 90, 180 or 270 and `mirror` flips in x,
 both free in the same pass. Returns the `(width, height)` written, or `None`
 if no frame arrived.
 
-`dst` must be cache-line aligned, since the PPA writes it by DMA — a panel
-framebuffer already is. A misaligned buffer raises rather than being quietly
-shifted, because the corruption would surface somewhere else entirely.
+`dst` should be cache-line aligned, since the PPA writes it by DMA. A panel
+framebuffer already is. A misaligned buffer still gets the right picture, but
+from ppa's software path, about 15 times slower. The PPA scales in sixteenths,
+so a ratio it can't make exactly fills a few pixels less of the block rather
+than leaving the preview to software.
 
 **`capture_yuy2(buf, width, height, timeout=1000)`**
 
-Converts to YUY2 and scales to `width` x `height` while copying. This exists
-because UVC — what a USB webcam speaks — wants YUY2, and doing that
-conversion in Python is not viable.
+Converts to YUY2 and scales to `width` x `height` while copying, through ppa.
+This exists because UVC — what a USB webcam speaks — wants YUY2, and doing
+that conversion in Python is not viable. From the 800x800 sensor, 320x240
+keeps the camera's 36 fps and 640x480 manages about 12, since neither ratio is
+one the PPA makes and the scale runs in software.
 
 **`capture_jpeg(quality=80, timeout=1000)` → `bytes` | `None`**
 

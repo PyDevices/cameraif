@@ -388,6 +388,8 @@ measurement trap that makes a naive sweep lie about it, are in the report:
 filed upstream as
 [esp-video-components#97](https://github.com/espressif/esp-video-components/issues/97).
 
+What's planned next is in [ROADMAP.md](ROADMAP.md).
+
 ## Licence
 
 MIT.

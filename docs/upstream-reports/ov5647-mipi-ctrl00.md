@@ -12,8 +12,7 @@ knowledgeable colleague would. What we cut, and where it lives instead:
   transmits, any later value keeps it transmitting, so a sweep only shows
   which value *started* it. Deinit between trials, and count DMA completions
   rather than return codes, because every call on this path returns `ESP_OK`
-  whether or not a pixel moves. Now in `docs/agent-knowledge/device-debugging.md`
-  in the workspace anchor.
+  whether or not a pixel moves.
 - The CSI host PHY read that proved the sensor silent rather than the receiver
   deaf. Same place. Offer it in the thread only if asked how we know.
 - Our own two wrong tables. Nobody upstream needs them.

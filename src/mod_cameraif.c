@@ -56,7 +56,6 @@
 #include "driver/i2c_master.h"
 #include "esp_private/esp_gpio_reserve.h"
 #include "driver/isp.h"
-#include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -73,6 +72,33 @@ extern void displayif_unregister_soft_reset(void (*fn)(void)) __attribute__((wea
 // is missing. Its arguments: pixels, len, width, height, stride, format (0 =
 // RGB565), swap, quality, subsample (4:2:0), hardware (-1 = when there is
 // one), exact, used_hw.
+// The PPA's scaling and colour conversion are ppa's (micropython-pydevices'
+// modules/ppa/src/ppa_mod.h), the same way: weak, so a firmware without ppa
+// still links and capture_scaled() / capture_yuy2() say what is missing.
+// Keep this struct in step with ppa_mod_srm_t there.
+typedef struct ppa_mod_client ppa_mod_client_t;
+typedef struct {
+    const void *src;
+    uint32_t src_w, src_h;
+    int src_fmt;
+    uint32_t sx, sy, sw, sh;
+    void *dst;
+    size_t dst_len;
+    uint32_t dst_w, dst_h;
+    int dst_fmt;
+    uint32_t x, y, w, h;
+    int rotate;
+    bool mirror_x, mirror_y;
+    bool swap;
+    bool yuv_limited;
+    bool approx;
+} ppa_mod_srm_t;
+extern ppa_mod_client_t *ppa_mod_open(int hw) __attribute__((weak));
+extern void ppa_mod_close(ppa_mod_client_t *c) __attribute__((weak));
+extern const char *ppa_mod_srm(ppa_mod_client_t *c, const ppa_mod_srm_t *op) __attribute__((weak));
+#define CAMERAIF_PPA_RGB565 0
+#define CAMERAIF_PPA_YUY2 4
+
 extern mp_obj_t jpegio_encode(const void *pixels, size_t len, int width, int height, size_t stride,
     int format, bool swap, int quality, bool subsample, int hardware, bool exact, bool *used_hw) __attribute__((weak));
 
@@ -98,7 +124,9 @@ typedef struct {
     bool test_pattern;           // last requested; the ioctl has no read side
     esp_cam_ctlr_handle_t cam;
     isp_proc_handle_t isp;
-    ppa_client_handle_t ppa;
+    ppa_mod_client_t *ppa;       // ppa's client: the PPA, for capture_scaled/capture_yuy2
+    uint8_t *yuy2_buf;           // where the PPA writes YUY2 before the caller's buffer
+    size_t yuy2_len;
     esp_ldo_channel_handle_t ldo;
     i2c_master_bus_handle_t i2c;
     bool owns_i2c;              // false when we joined machine.I2C's bus
@@ -211,8 +239,13 @@ static void cameraif_teardown(void) {
         c->isp = NULL;
     }
     if (c->ppa) {
-        ppa_unregister_client(c->ppa);
+        ppa_mod_close(c->ppa);
         c->ppa = NULL;
+    }
+    if (c->yuy2_buf) {
+        heap_caps_free(c->yuy2_buf);
+        c->yuy2_buf = NULL;
+        c->yuy2_len = 0;
     }
     if (c->sensor) {
         int off = 0;
@@ -722,16 +755,30 @@ static mp_obj_t cameraif_capture(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_obj, 1, 3, cameraif_capture);
 
+// The PPA client capture_scaled and capture_yuy2 share; raises when the
+// firmware has no ppa module.
+static ppa_mod_client_t *cameraif_ppa(cameraif_obj_t *c) {
+    if (ppa_mod_open == NULL) {
+        mp_raise_msg(&mp_type_OSError,
+            MP_ERROR_TEXT("this needs the ppa module in the firmware"));
+    }
+    if (c->ppa == NULL) {
+        c->ppa = ppa_mod_open(-1);      // the PPA; software only where it has no format (YUY2 before rev 3)
+        if (c->ppa == NULL) {
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("no ppa client"));
+        }
+    }
+    return c->ppa;
+}
+
 // capture_yuy2(buf, width, height, timeout=1000)
 //
-// RGB565 to YUY2, scaled down by integer decimation, in one pass. Both jobs
-// together on purpose: a UVC device advertises YUY2 because every host has a
-// path for it, and advertises one fixed frame size chosen at build time,
-// while a sensor produces what a sensor produces. Two passes over a megabyte
-// would be a waste on a board with better uses for the time.
-//
-// Decimation, not averaging: nearest-neighbour is a few instructions per
-// output pixel and needs no line buffer. A resampler is a different module.
+// The next frame scaled to width x height and converted to YUY2, the format a
+// UVC device advertises because every host has a path for it, at one fixed
+// size chosen at build time. ppa does both on the P4's PPA, in one pass:
+// full-range BT.601, chroma from each pixel pair. The PPA writes into a
+// buffer of ours (DMA wants it cache-line aligned, and writes UYVY, which ppa
+// turns into YUY2), then one copy goes to yours.
 static mp_obj_t cameraif_capture_yuy2(size_t n_args, const mp_obj_t *args) {
     cameraif_obj_t *c = MP_OBJ_TO_PTR(args[0]);
     mp_buffer_info_t buf;
@@ -757,40 +804,30 @@ static mp_obj_t cameraif_capture_yuy2(size_t n_args, const mp_obj_t *args) {
         mp_raise_msg(&mp_type_ValueError,
             MP_ERROR_TEXT("output larger than the sensor frame"));
     }
+    ppa_mod_client_t *pc = cameraif_ppa(c);
+    if (c->yuy2_len < need) {
+        if (c->yuy2_buf) {
+            heap_caps_free(c->yuy2_buf);
+        }
+        c->yuy2_buf = heap_caps_aligned_calloc(64, 1, (need + 63) & ~63u, MALLOC_CAP_SPIRAM);
+        c->yuy2_len = c->yuy2_buf ? need : 0;
+        if (c->yuy2_buf == NULL) {
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("YUY2 buffer"));
+        }
+    }
     if (!cameraif_wait_frame(c, timeout, true)) {
         return MP_OBJ_NEW_SMALL_INT(0);
     }
-
-    const uint16_t *src = (const uint16_t *)c->frame;
-    uint8_t *dst = (uint8_t *)buf.buf;
-    const int xstep = c->width / out_w;
-    const int ystep = c->height / out_h;
-    size_t o = 0;
-    for (int y = 0; y < out_h; y++) {
-        const uint16_t *row = src + (size_t)(y * ystep) * c->width;
-        for (int x = 0; x < out_w; x += 2) {
-            const uint16_t p0 = row[x * xstep];
-            const uint16_t p1 = row[(x + 1) * xstep];
-            const int r0 = ((p0 >> 11) & 0x1F) << 3, g0 = ((p0 >> 5) & 0x3F) << 2,
-                      b0 = (p0 & 0x1F) << 3;
-            const int r1 = ((p1 >> 11) & 0x1F) << 3, g1 = ((p1 >> 5) & 0x3F) << 2,
-                      b1 = (p1 & 0x1F) << 3;
-            // BT.601 in fixed point. Chroma from the pair's average, which is
-            // what YUY2 subsampling means.
-            const int y0 = (77 * r0 + 150 * g0 + 29 * b0) >> 8;
-            const int y1 = (77 * r1 + 150 * g1 + 29 * b1) >> 8;
-            const int ra = (r0 + r1) >> 1, ga = (g0 + g1) >> 1, ba = (b0 + b1) >> 1;
-            const int ya = (77 * ra + 150 * ga + 29 * ba) >> 8;
-            int u = 128 + (((ba - ya) * 144) >> 8);
-            int v = 128 + (((ra - ya) * 183) >> 8);
-            if (u < 0) { u = 0; } else if (u > 255) { u = 255; }
-            if (v < 0) { v = 0; } else if (v > 255) { v = 255; }
-            dst[o++] = (uint8_t)(y0 > 255 ? 255 : y0);
-            dst[o++] = (uint8_t)u;
-            dst[o++] = (uint8_t)(y1 > 255 ? 255 : y1);
-            dst[o++] = (uint8_t)v;
-        }
+    ppa_mod_srm_t op = {
+        .src = c->frame, .src_w = c->width, .src_h = c->height, .src_fmt = CAMERAIF_PPA_RGB565,
+        .dst = c->yuy2_buf, .dst_len = c->yuy2_len, .dst_w = out_w, .dst_h = out_h,
+        .dst_fmt = CAMERAIF_PPA_YUY2,
+    };
+    const char *why = ppa_mod_srm(pc, &op);
+    if (why != NULL) {
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("ppa: %s"), why);
     }
+    memcpy(buf.buf, c->yuy2_buf, need);
     return MP_OBJ_NEW_SMALL_INT((mp_int_t)need);
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_yuy2_obj, 4, 5,
@@ -1145,56 +1182,29 @@ static mp_obj_t cameraif_capture_scaled(size_t n_args, const mp_obj_t *pos,
             MP_ERROR_TEXT("dst must be %d-byte aligned for DMA"), (int)align);
     }
 
-    if (c->ppa == NULL) {
-        ppa_client_config_t pc = { .oper_type = PPA_OPERATION_SRM };
-        if (ppa_register_client(&pc, &c->ppa) != ESP_OK) {
-            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no PPA client"));
-        }
-    }
+    ppa_mod_client_t *pc = cameraif_ppa(c);
 
     if (!cameraif_wait_frame(c, a[ARG_timeout].u_int, false)) {
         return mp_const_none;
     }
 
-    static const ppa_srm_rotation_angle_t angles[4] = {
-        PPA_SRM_ROTATION_ANGLE_0, PPA_SRM_ROTATION_ANGLE_90,
-        PPA_SRM_ROTATION_ANGLE_180, PPA_SRM_ROTATION_ANGLE_270,
-    };
     int rot = a[ARG_rotate].u_int;
     if (rot % 90) {
         mp_raise_ValueError(MP_ERROR_TEXT("rotate must be 0, 90, 180 or 270"));
     }
-    rot = ((rot / 90) % 4 + 4) % 4;
-
-    // Rotation happens after scaling, so at 90 or 270 the scale factors are
-    // the ones that make the *rotated* result fill w x h.
-    const bool swap = (rot == 1 || rot == 3);
-    ppa_srm_oper_config_t op = {
-        .in = {
-            .buffer = c->frame,
-            .pic_w = c->width, .pic_h = c->height,
-            .block_w = c->width, .block_h = c->height,
-            .block_offset_x = 0, .block_offset_y = 0,
-            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        },
-        .out = {
-            .buffer = dst.buf,
-            .buffer_size = (uint32_t)dst.len,
-            .pic_w = pic_w, .pic_h = pic_h,
-            .block_offset_x = x, .block_offset_y = y,
-            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        },
-        .rotation_angle = angles[rot],
-        .scale_x = (float)(swap ? h : w) / (float)c->width,
-        .scale_y = (float)(swap ? w : h) / (float)c->height,
+    // ppa: scale the whole frame to fill the block, rotated counter-clockwise
+    // (the PPA's direction) after scaling, then mirrored
+    ppa_mod_srm_t op = {
+        .src = c->frame, .src_w = c->width, .src_h = c->height, .src_fmt = CAMERAIF_PPA_RGB565,
+        .dst = dst.buf, .dst_len = dst.len, .dst_w = pic_w, .dst_h = pic_h, .dst_fmt = CAMERAIF_PPA_RGB565,
+        .x = x, .y = y, .w = w, .h = h,
+        .rotate = ((rot / 90) % 4 + 4) % 4 * 90,
         .mirror_x = a[ARG_mirror].u_bool,
-        .mirror_y = false,
-        .mode = PPA_TRANS_MODE_BLOCKING,
+        .approx = true,     // the PPA's nearest sixteenth, as before: a preview stays in hardware
     };
-    esp_err_t err = ppa_do_scale_rotate_mirror(c->ppa, &op);
-    if (err != ESP_OK) {
-        mp_raise_msg_varg(&mp_type_OSError,
-            MP_ERROR_TEXT("PPA scale failed (%d)"), (int)err);
+    const char *why = ppa_mod_srm(pc, &op);
+    if (why != NULL) {
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("ppa: %s"), why);
     }
     mp_obj_t size[2] = { MP_OBJ_NEW_SMALL_INT(w), MP_OBJ_NEW_SMALL_INT(h) };
     return mp_obj_new_tuple(2, size);

@@ -33,7 +33,6 @@ if(ESP_PLATFORM)
         idf::esp_driver_cam
         idf::esp_driver_isp
         idf::esp_driver_jpeg
-        idf::esp_driver_ppa
     )
 endif()
 

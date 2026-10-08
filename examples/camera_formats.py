@@ -19,18 +19,27 @@ import cameraif
 from board_config import display_drv as display
 
 
-def _pins_from_board():
-    """Reuse whatever board_config used to open its camera."""
-    # board_config typically keeps constructor kwargs on the helper; fall
-    # back to the documented Waveshare P4-WIFI6-Touch-LCD-4B defaults if not.
-    cam_helper = getattr(board_config, "camera_pins", None)
-    if callable(cam_helper):
-        return cam_helper()
+def _open(name):
+    """Open the camera again with *name*, the way the board opened it.
+
+    The board's own ``camera()`` helper knows which I2C port and pins the
+    camera shares with touch and the codecs, so a fresh ``Camera`` goes
+    through it when the board has one.
+    """
+    import sys
+
+    helper = getattr(sys.modules.get("board_peripherals"), "camera", None)
+    if callable(helper):
+        return helper(format=name)
     pins = getattr(board_config, "CAMERA_PINS", None)
-    if isinstance(pins, dict):
-        return pins
-    # Waveshare ESP32-P4-WIFI6-Touch-LCD-4B (the reference board).
-    return {"sda": 7, "scl": 8, "reset": 21, "i2c": 0}
+    if not isinstance(pins, dict):
+        raise RuntimeError("this board_config has no camera() helper or CAMERA_PINS")
+    return cameraif.Camera(pins["sda"], pins["scl"],
+                           format=name,
+                           i2c=pins.get("i2c", 0),
+                           reset=pins.get("reset", -1),
+                           pwdn=pins.get("pwdn", -1),
+                           xclk=pins.get("xclk", -1))
 
 
 def main():
@@ -57,13 +66,7 @@ def main():
     name, w, h = choice
     print("opening format %r (%dx%d)" % (name, w, h))
 
-    pins = _pins_from_board()
-    cam = cameraif.Camera(pins["sda"], pins["scl"],
-                          format=name,
-                          i2c=pins.get("i2c", 0),
-                          reset=pins.get("reset", -1),
-                          pwdn=pins.get("pwdn", -1),
-                          xclk=pins.get("xclk", -1))
+    cam = _open(name)
     print("now", cam.sensor(), cam.size())
 
     fb = display.framebuffers()[0]

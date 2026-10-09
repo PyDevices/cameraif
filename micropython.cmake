@@ -1,10 +1,12 @@
 # cameraif: MIPI-CSI camera capture as a MicroPython native module.
 #
-# For Makefile-based ports there is deliberately no micropython.mk: every
+# MicroPython's Makefile-based ports get nothing from micropython.mk: every
 # line of this module is ESP32-P4 CSI hardware, so there is nothing a unix
-# or rp2 build could compile. The Python-facing functions still exist on
-# those ports -- mod_cameraif.c guards its bodies -- so an application can
-# ask `cameraif.available()` rather than catching ImportError.
+# build could compile. micropython.mk is CircuitPython's route in, since
+# CircuitPython builds its espressif port with make. On a CMake port without
+# CSI the Python-facing functions still exist -- mod_cameraif.c guards its
+# bodies -- so an application can ask `cameraif.available()` rather than
+# catching ImportError.
 set(CAMERAIF_MOD_DIR ${CMAKE_CURRENT_LIST_DIR})
 set(CAMERAIF_SRC_DIR ${CAMERAIF_MOD_DIR}/src)
 

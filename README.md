@@ -48,7 +48,9 @@ difference between a working camera and a plausible-looking failure:
 
 `cameraif` is a user C module for the ESP32-P4; every line of it is MIPI-CSI
 hardware. On rp2 it still builds, with its bodies stubbed and `available()`
-answering `False`; Make ports such as unix have no build glue for it at all.
+answering `False`; MicroPython's Make ports such as unix have no build glue
+for it at all. It also builds into CircuitPython-compatible firmware for an
+ESP32-P4 (see [On CircuitPython](#on-circuitpython) below).
 
 The esp32 port needs two small patches first: the sensor-driver component and
 its sdkconfig (see [patches/](patches/); both apply cleanly to MicroPython
@@ -89,6 +91,26 @@ The `AUTO_DETECT` symbol is what registers the driver's probe in the linker
 section the component scans. Set only the first and the driver compiles,
 links, and is never asked anything.
 
+### On CircuitPython
+
+CircuitPython's espressif port builds with make, through
+[micropython.mk](micropython.mk). It needs the port to build the camera's
+ESP-IDF components and the sensor drivers, which it doesn't on its own, so
+build with [micropython-pydevices](https://github.com/PyDevices/micropython-pydevices):
+its CircuitPython patches add that, and its `build_mp.py` fetches the sensor
+drivers at a pinned version.
+
+```bash
+./build_mp.py --interpreter circuitpython --port espressif \
+    --board waveshare_esp32p4_wifi6_dev_kit --modules cameraif,jpegio,ppa
+```
+
+`jpegio` gives `capture_jpeg()` the P4's JPEG engine and `ppa` gives
+`capture_scaled()` its scaler. The board's sdkconfig enables the sensor
+drivers, as above. On CircuitPython, `i2c=` can also be a `busio.I2C`, such as
+`board.I2C()`, and the camera joins that bus. The camera closes at the end of
+every program, before CircuitPython releases the board's I2C bus.
+
 ## API
 
 ### `Camera(sda, scl, **kwargs)`
@@ -100,7 +122,7 @@ time — the P4 has one CSI controller — and constructing a second one raises.
 | Argument | Default | Meaning |
 |---|---|---|
 | `sda`, `scl` | — | I2C pins the sensor answers on (SCCB) |
-| `i2c` | `0` | I2C port. **Use the port that already owns these pins** — see below |
+| `i2c` | `0` | I2C port. **Use the port that already owns these pins** — see below. On CircuitPython, a `busio.I2C` too |
 | `ldo_chan` | `3` | LDO channel powering the MIPI D-PHY |
 | `ldo_mv` | `2500` | LDO voltage, millivolts |
 | `reset` | `-1` | Sensor reset pin, `-1` for none |

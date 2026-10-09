@@ -56,6 +56,12 @@
 #include "driver/i2c_master.h"
 #include "esp_private/esp_gpio_reserve.h"
 #include "driver/isp.h"
+#include "esp_idf_version.h"
+#if defined(CIRCUITPY)
+// On CircuitPython the SCCB bus can be a busio.I2C (board.I2C(), say): the
+// camera joins that bus rather than guessing which I2C port it landed on.
+#include "shared-bindings/busio/I2C.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -283,6 +289,20 @@ static void cameraif_teardown(void) {
     }
 }
 
+#if defined(CIRCUITPY)
+// CircuitPython's espressif port calls this at the end of every program,
+// before it deletes the board buses (reset_port_early in its
+// supervisor/port.c; micropython-pydevices' CircuitPython patches add the
+// call). The camera's SCCB device would otherwise keep board.I2C from being
+// deleted, and the CSI controller, the ISP and the PHY's LDO would outlive
+// the program that opened them. The same job as displayif's soft-reset hook
+// on MicroPython.
+void cameraif_reset(void);
+void cameraif_reset(void) {
+    cameraif_teardown();
+}
+#endif
+
 // Map a sensor's declared output to the ISP's input colour type.
 //
 // The hardcoded RAW8 this replaced was right for the OV5647 and silently
@@ -313,7 +333,9 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         // harder to notice than a missing argument.
         { MP_QSTR_sda,          MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = -1} },
         { MP_QSTR_scl,          MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = -1} },
-        { MP_QSTR_i2c,          MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int = 0} },
+        // The I2C port whose bus to join (or create). On CircuitPython, a
+        // busio.I2C as well.
+        { MP_QSTR_i2c,          MP_ARG_KW_ONLY | MP_ARG_OBJ,  {.u_rom_obj = MP_ROM_INT(0)} },
         // MIPI PHY power. Channel 3 at 2500 mV is the P4's own arrangement,
         // not a board choice, so it defaults.
         { MP_QSTR_ldo_chan,     MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int = 3} },
@@ -360,6 +382,24 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("MIPI PHY LDO unavailable"));
     }
 
+    // Which bus: an I2C port number, or on CircuitPython a busio.I2C, whose
+    // own bus handle is used (busio picks its port itself and doesn't say).
+    i2c_master_bus_handle_t given_bus = NULL;
+    int i2c_port = 0;
+    #if defined(CIRCUITPY)
+    if (mp_obj_is_type(args[ARG_i2c].u_obj, &busio_i2c_type)) {
+        busio_i2c_obj_t *bus = MP_OBJ_TO_PTR(args[ARG_i2c].u_obj);
+        if (common_hal_busio_i2c_deinited(bus)) {
+            cameraif_teardown();
+            mp_raise_ValueError(MP_ERROR_TEXT("that I2C bus has been deinitialised"));
+        }
+        given_bus = bus->handle;
+    } else
+    #endif
+    {
+        i2c_port = mp_obj_get_int(args[ARG_i2c].u_obj);
+    }
+
     // Join the bus if this port already has one; only build a bus if it does
     // not.
     //
@@ -370,8 +410,11 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
     // matrix and both appear to work, until the other device is next read and
     // times out. Here that meant opening a camera silently killed the
     // touchscreen, and every symptom pointed somewhere else entirely.
-    if (i2c_master_get_bus_handle(args[ARG_i2c].u_int, &c->i2c) == ESP_OK
-        && c->i2c != NULL) {
+    if (given_bus != NULL) {
+        c->i2c = given_bus;
+        c->owns_i2c = false;
+    } else if (i2c_master_get_bus_handle(i2c_port, &c->i2c) == ESP_OK
+               && c->i2c != NULL) {
         c->owns_i2c = false;
     } else {
         // Refuse to open a second master on pins something already owns.
@@ -393,7 +436,7 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         }
         i2c_master_bus_config_t i2c_cfg = {
             .clk_source = I2C_CLK_SRC_DEFAULT,
-            .i2c_port = args[ARG_i2c].u_int,
+            .i2c_port = i2c_port,
             .scl_io_num = args[ARG_scl].u_int,
             .sda_io_num = args[ARG_sda].u_int,
             .glitch_ignore_cnt = 7,
@@ -539,25 +582,40 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         .lane_bit_rate_mbps = args[ARG_lane_mbps].u_int > 0
             ? (uint32_t)args[ARG_lane_mbps].u_int
             : chosen->mipi_info.mipi_clk / 1000000,
+        #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+        // From ESP-IDF 6.0 the CSI bridge converts colour itself, from the
+        // input type to the output type, and refuses RAW8 to RGB565 with
+        // ESP_ERR_NOT_SUPPORTED. With the ISP in the path the bridge receives
+        // the ISP's output, so its input is RGB565 too and it passes the
+        // frames through, as esp_video configures it on 6.0.
+        .input_data_color_type = c->raw ? CAM_CTLR_COLOR_RAW8
+                                        : CAM_CTLR_COLOR_RGB565,
+        #else
         .input_data_color_type = CAM_CTLR_COLOR_RAW8,
+        #endif
         .output_data_color_type = c->raw ? CAM_CTLR_COLOR_RAW8
                                          : CAM_CTLR_COLOR_RGB565,
         .data_lane_num = chosen->mipi_info.lane_num,
         .byte_swap_en = false,
         .queue_items = 1,
     };
-    if (esp_cam_new_csi_ctlr(&csi_cfg, &c->cam) != ESP_OK) {
+    // The ESP-IDF error goes into the message: these fail for reasons a
+    // board can't show (a clock source, memory, a bridge already claimed),
+    // and without the name every one reads the same.
+    esp_err_t err = esp_cam_new_csi_ctlr(&csi_cfg, &c->cam);
+    if (err != ESP_OK) {
         cameraif_teardown();
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("CSI controller init failed"));
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("CSI controller init failed (%s, 0x%x)"), esp_err_to_name(err), (unsigned)err);
     }
     esp_cam_ctlr_evt_cbs_t cbs = {
         .on_get_new_trans = cameraif_on_get_new_trans,
         .on_trans_finished = cameraif_on_trans_finished,
     };
     esp_cam_ctlr_register_event_callbacks(c->cam, &cbs, NULL);
-    if (esp_cam_ctlr_enable(c->cam) != ESP_OK) {
+    err = esp_cam_ctlr_enable(c->cam);
+    if (err != ESP_OK) {
         cameraif_teardown();
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("CSI enable failed"));
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("CSI enable failed (%s, 0x%x)"), esp_err_to_name(err), (unsigned)err);
     }
 
     if (!c->raw) {
@@ -571,9 +629,10 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
             .h_res = c->width,
             .v_res = c->height,
         };
-        if (esp_isp_new_processor(&isp_cfg, &c->isp) != ESP_OK) {
+        err = esp_isp_new_processor(&isp_cfg, &c->isp);
+        if (err != ESP_OK) {
             cameraif_teardown();
-            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("ISP init failed"));
+            mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("ISP init failed (%s, 0x%x)"), esp_err_to_name(err), (unsigned)err);
         }
         esp_isp_enable(c->isp);
     }

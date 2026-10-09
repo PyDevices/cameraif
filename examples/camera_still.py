@@ -8,11 +8,11 @@ board's filesystem. Press again for another. Fetch them with::
     mpremote ls
     mpremote cp :photo_001.jpg .
 
-**How the button gets here.** `board_config` publishes the BOOT button
-through `keypad_read`, and `appdev` turns that into ordinary KEYDOWN events
--- the same events a USB keyboard would produce. Nothing in this file knows
-which GPIO it is or that it is active-low, which is why the same file works
-on a board that wires its shutter somewhere else.
+**How the button gets here.** `board_config` publishes the BOOT button as
+`boot_button`, a plain input. This file wraps it in `GPIOButtons`, and
+`appdev` turns that into ordinary KEYDOWN events -- the same events a USB
+keyboard would produce. Nothing in this file knows which GPIO it is, which is
+why the same file works on a board that wires its BOOT button somewhere else.
 
 **On the shape of this file.** `appdev` is the scheduler. It polls the input
 devices, dispatches the events, and keeps the program alive after the last
@@ -42,7 +42,9 @@ Press the board's reset button, or::
 
 import appdev
 import board_config
+import keys
 from board_config import display_drv as display
+from keypad_gpio import GPIOButtons
 
 QUALITY = 90
 # The preview costs about 54 ms a frame, so a period below that would eat the
@@ -51,6 +53,11 @@ PREVIEW_MS = 100
 
 app = appdev.App(board_config)
 cam = board_config.camera
+
+# BOOT as a key: the board hands over the raw input, and this app decides it
+# is the shutter.
+shutter_button = GPIOButtons({"shutter": (board_config.boot_button, keys.K_LCTRL)})
+app.add_keypad(shutter_button.read)
 
 # The panel's own scanout buffer. capture_scaled() scales the camera frame
 # into it with the PPA, by DMA, so the live view costs the CPU one call.

@@ -135,7 +135,8 @@ time — the P4 has one CSI controller — and constructing a second one raises.
 | `lane_mbps` | `0` | Override the driver's MIPI lane bit rate; `0` trusts it |
 | `exposure` | `None` | Initial exposure, 0–100 percent of the sensor's range |
 | `gain` | `None` | Initial gain, 0–100. Not every driver has one — see `controls()` |
-| `flip`, `mirror` | `False` | Initial orientation |
+| `flip`, `mirror` | `False` | Initial orientation, upright by default |
+| `bayer` | `None` | The ISP's colour order (`"BGGR"`, `"GBRG"`, `"GRBG"`, `"RGGB"`); `None` works it out from the sensor and the orientation |
 | `test_pattern` | `False` | Start with the sensor's internal pattern |
 
 Board facts are arguments rather than build-time constants on purpose: the
@@ -281,7 +282,13 @@ is there for when you do mean the sensor's own numbers.
 | `gain(pct=None, *, raw=False)` | Gain. Tries absolute `GAIN`, falls back to analogue `ANGAIN` |
 | `flip(on=None)` | Vertical flip, in the sensor. A bool |
 | `mirror(on=None)` | Horizontal mirror, in the sensor. A bool |
+| `bayer()` | The colour order the ISP opened with |
 | `test_pattern(on=None)` | The sensor's internal pattern |
+
+**Change flip or mirror at open, not afterwards, if you want true colours.**
+Either one moves the sensor's 2×2 colour cell, and the ISP's order is fixed
+when the camera opens, so `flip()` or `mirror()` on a running camera tints
+the picture. Close the camera and open it again with `flip=` and `mirror=`.
 
 **Reading a control returns `None` when the driver cannot answer**, rather
 than a number. This matters more than it looks: the OV5647 driver's

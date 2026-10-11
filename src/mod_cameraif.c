@@ -314,9 +314,14 @@ void cameraif_reset(void) {
 // the 2x2 cell's columns and a flip its rows. Left at the ISP's default
 // (BGGR) an OV5647 (GBRG) came out green, and each flip or mirror tinted it
 // differently.
+//
+// The declared order describes the readout the driver's mode table leaves,
+// and that isn't always upright: every OV5647 table in esp_cam_sensor sets
+// 0x3821 bit 1, so each mode opens mirrored and its GBRG is the mirrored
+// cell. `table_mirror` says so, and only a change from it swaps columns.
 static const char *const cameraif_bayer_names[] = { "BGGR", "GBRG", "GRBG", "RGGB" };  // color_raw_element_order_t
 
-static int cameraif_bayer_for(const esp_cam_sensor_format_t *f, bool flip, bool mirror) {
+static int cameraif_bayer_for(const esp_cam_sensor_format_t *f, bool flip, bool mirror, bool table_mirror) {
     static const char *const sensor_order[] = { "RGGB", "GRBG", "GBRG", "BGGR" };  // esp_cam_sensor_bayer_pattern_t
     int b = ESP_CAM_SENSOR_BAYER_BGGR;
     if (f->isp_info != NULL && f->isp_info->isp_v1_info.bayer_type <= ESP_CAM_SENSOR_BAYER_BGGR) {
@@ -325,7 +330,7 @@ static int cameraif_bayer_for(const esp_cam_sensor_format_t *f, bool flip, bool 
     char p[4];
     memcpy(p, sensor_order[b], 4);
     char t;
-    if (mirror) {
+    if (mirror != table_mirror) {
         t = p[0]; p[0] = p[1]; p[1] = t;
         t = p[2]; p[2] = p[3]; p[3] = t;
     }
@@ -590,7 +595,8 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
 
     c->width = chosen->width;
     c->height = chosen->height;
-    c->bayer = cameraif_bayer_for(chosen, args[ARG_flip].u_bool, args[ARG_mirror].u_bool);
+    c->bayer = cameraif_bayer_for(chosen, args[ARG_flip].u_bool, args[ARG_mirror].u_bool,
+        c->sensor->id.pid == CAMERAIF_OV5647_PID);
     if (args[ARG_bayer].u_obj != mp_const_none) {
         const char *want = mp_obj_str_get_str(args[ARG_bayer].u_obj);
         int i = 0;
@@ -738,12 +744,10 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
     } else {
         cameraif_set_para_fraction(ESP_CAM_SENSOR_GAIN, 25);
     }
-    if (args[ARG_flip].u_bool) {
-        cameraif_set_para(ESP_CAM_SENSOR_VFLIP, 1);
-    }
-    if (args[ARG_mirror].u_bool) {
-        cameraif_set_para(ESP_CAM_SENSOR_HMIRROR, 1);
-    }
+    // Both, always: a mode table may leave either set (every OV5647 mode
+    // opens mirrored), so mirror=False has to be written too.
+    cameraif_set_para(ESP_CAM_SENSOR_VFLIP, args[ARG_flip].u_bool);
+    cameraif_set_para(ESP_CAM_SENSOR_HMIRROR, args[ARG_mirror].u_bool);
     if (args[ARG_test_pattern].u_bool) {
         int on = 1;
         esp_cam_sensor_ioctl(c->sensor, ESP_CAM_SENSOR_IOC_S_TEST_PATTERN, &on);

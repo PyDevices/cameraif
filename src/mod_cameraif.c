@@ -117,6 +117,7 @@ typedef struct {
     uint16_t width, height;
     size_t frame_bytes;
     uint8_t bytes_per_px;
+    uint8_t bayer;  // the ISP's colour_raw_element_order_t, as the camera opened
     uint8_t *fb[2];
     uint8_t *frame;             // the buffer Python may read; never queued
     // Which buffer belongs to whom. The DMA and the Python reader must never
@@ -308,6 +309,38 @@ void cameraif_reset(void) {
 // The hardcoded RAW8 this replaced was right for the OV5647 and silently
 // wrong for anything emitting RAW10 -- the ISP would misread every frame
 // while every call still returned success.
+// The ISP's colour order for a sensor's Bayer pattern, as flip and mirror
+// leave it: the sensor reads its array the other way round, so a mirror swaps
+// the 2x2 cell's columns and a flip its rows. Left at the ISP's default
+// (BGGR) an OV5647 (GBRG) came out green, and each flip or mirror tinted it
+// differently.
+static const char *const cameraif_bayer_names[] = { "BGGR", "GBRG", "GRBG", "RGGB" };  // color_raw_element_order_t
+
+static int cameraif_bayer_for(const esp_cam_sensor_format_t *f, bool flip, bool mirror) {
+    static const char *const sensor_order[] = { "RGGB", "GRBG", "GBRG", "BGGR" };  // esp_cam_sensor_bayer_pattern_t
+    int b = ESP_CAM_SENSOR_BAYER_BGGR;
+    if (f->isp_info != NULL && f->isp_info->isp_v1_info.bayer_type <= ESP_CAM_SENSOR_BAYER_BGGR) {
+        b = f->isp_info->isp_v1_info.bayer_type;
+    }
+    char p[4];
+    memcpy(p, sensor_order[b], 4);
+    char t;
+    if (mirror) {
+        t = p[0]; p[0] = p[1]; p[1] = t;
+        t = p[2]; p[2] = p[3]; p[3] = t;
+    }
+    if (flip) {
+        t = p[0]; p[0] = p[2]; p[2] = t;
+        t = p[1]; p[1] = p[3]; p[3] = t;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (memcmp(p, cameraif_bayer_names[i], 4) == 0) {
+            return i;
+        }
+    }
+    return 0;
+}
+
 static bool cameraif_isp_input_for(int sensor_format, isp_color_t *out) {
     switch (sensor_format) {
         case ESP_CAM_SENSOR_PIXFORMAT_RAW8:  *out = ISP_COLOR_RAW8;  return true;
@@ -326,6 +359,7 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         ARG_reset, ARG_pwdn, ARG_xclk, ARG_xclk_hz,
         ARG_format, ARG_pixel_format, ARG_raw, ARG_lane_mbps,
         ARG_exposure, ARG_gain, ARG_flip, ARG_mirror, ARG_test_pattern,
+        ARG_bayer,
     };
     static const mp_arg_t allowed[] = {
         // Board wiring. sda/scl are required: a camera module cannot guess
@@ -358,6 +392,9 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         { MP_QSTR_flip,         MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
         { MP_QSTR_mirror,       MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
         { MP_QSTR_test_pattern, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
+        // The ISP's colour order ("BGGR", "GBRG", "GRBG", "RGGB"). Default:
+        // the sensor's own, as flip= and mirror= leave it.
+        { MP_QSTR_bayer,        MP_ARG_KW_ONLY | MP_ARG_OBJ,  {.u_obj = mp_const_none} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed),
@@ -553,6 +590,19 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
 
     c->width = chosen->width;
     c->height = chosen->height;
+    c->bayer = cameraif_bayer_for(chosen, args[ARG_flip].u_bool, args[ARG_mirror].u_bool);
+    if (args[ARG_bayer].u_obj != mp_const_none) {
+        const char *want = mp_obj_str_get_str(args[ARG_bayer].u_obj);
+        int i = 0;
+        while (i < 4 && strcmp(want, cameraif_bayer_names[i]) != 0) {
+            i++;
+        }
+        if (i == 4) {
+            cameraif_teardown();
+            mp_raise_ValueError(MP_ERROR_TEXT("bayer is one of BGGR, GBRG, GRBG, RGGB"));
+        }
+        c->bayer = i;
+    }
     c->frame_bytes = (size_t)c->width * c->height * c->bytes_per_px;
 
     size_t align = 0;
@@ -628,6 +678,7 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
             .has_line_end_packet = false,
             .h_res = c->width,
             .v_res = c->height,
+            .bayer_order = (color_raw_element_order_t)c->bayer,
         };
         err = esp_isp_new_processor(&isp_cfg, &c->isp);
         if (err != ESP_OK) {
@@ -1334,12 +1385,23 @@ static mp_obj_t cameraif_del(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(cameraif_del_obj, cameraif_del);
 
+// bayer() -> the ISP's colour order the camera opened with ("GBRG", ...).
+// flip() and mirror() at run time leave it as it was: reopen the camera with
+// flip= and mirror= to get the colours right in the new orientation.
+static mp_obj_t cameraif_bayer(mp_obj_t self_in) {
+    (void)self_in;
+    cameraif_obj_t *c = &cameraif_singleton;
+    return mp_obj_new_str(cameraif_bayer_names[c->bayer], 4);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(cameraif_bayer_obj, cameraif_bayer);
+
 static const mp_rom_map_elem_t cameraif_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_capture), MP_ROM_PTR(&cameraif_capture_obj) },
     { MP_ROM_QSTR(MP_QSTR_capture_yuy2), MP_ROM_PTR(&cameraif_capture_yuy2_obj) },
     { MP_ROM_QSTR(MP_QSTR_capture_jpeg), MP_ROM_PTR(&cameraif_capture_jpeg_obj) },
     { MP_ROM_QSTR(MP_QSTR_size), MP_ROM_PTR(&cameraif_size_obj) },
     { MP_ROM_QSTR(MP_QSTR_sensor), MP_ROM_PTR(&cameraif_sensor_obj) },
+    { MP_ROM_QSTR(MP_QSTR_bayer), MP_ROM_PTR(&cameraif_bayer_obj) },
     { MP_ROM_QSTR(MP_QSTR_formats), MP_ROM_PTR(&cameraif_formats_obj) },
     { MP_ROM_QSTR(MP_QSTR_capture_scaled), MP_ROM_PTR(&cameraif_capture_scaled_obj) },
     { MP_ROM_QSTR(MP_QSTR_controls), MP_ROM_PTR(&cameraif_controls_obj) },

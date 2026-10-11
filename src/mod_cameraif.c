@@ -150,6 +150,7 @@ typedef struct {
     volatile bool awb_new;
     volatile uint32_t awb_n, awb_r, awb_g, awb_b;
     float gain_r, gain_b;
+    bool ccm_on;                // enabled once; enabling again logs an error every frame
     const float *ccm;           // the sensor's colour matrix, row by row (identity if none is known)
 } cameraif_obj_t;
 
@@ -401,8 +402,8 @@ static void cameraif_ccm_apply(cameraif_obj_t *c) {
         cfg.matrix[r][1] = m[r * 3 + 1];
         cfg.matrix[r][2] = m[r * 3 + 2] * c->gain_b;
     }
-    if (esp_isp_ccm_configure(c->isp, &cfg) == ESP_OK) {
-        esp_isp_ccm_enable(c->isp);
+    if (esp_isp_ccm_configure(c->isp, &cfg) == ESP_OK && !c->ccm_on) {
+        c->ccm_on = esp_isp_ccm_enable(c->isp) == ESP_OK;
     }
 }
 
@@ -462,6 +463,7 @@ static void cameraif_awb_start(cameraif_obj_t *c) {
         },
     };
     c->gain_r = c->gain_b = 1.0f;
+    c->ccm_on = false;          // a new ISP processor starts with it off
     cameraif_ccm_apply(c);
     if (esp_isp_new_awb_controller(c->isp, &cfg, &c->awb) != ESP_OK) {
         c->awb = NULL;

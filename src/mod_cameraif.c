@@ -41,6 +41,7 @@
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4) && CONFIG_IDF_TARGET_ESP32P4
 
+#include <math.h>
 #include <string.h>
 
 #include "esp_cam_ctlr.h"
@@ -141,6 +142,15 @@ typedef struct {
     esp_cam_sensor_device_t *sensor;
     SemaphoreHandle_t frame_ready;
     volatile uint32_t frames, dropped, isr_new, isr_done, last_received;
+    // Auto white balance: the ISP counts near-grey pixels before the colour
+    // matrix, the ISR keeps the latest sums, and each frame wait moves the
+    // matrix's red and blue gains toward them.
+    isp_awb_ctlr_t awb;
+    bool awb_on;
+    volatile bool awb_new;
+    volatile uint32_t awb_n, awb_r, awb_g, awb_b;
+    float gain_r, gain_b;
+    const float *ccm;           // the sensor's colour matrix, row by row (identity if none is known)
 } cameraif_obj_t;
 
 // One camera, mirrored in BSS.
@@ -239,6 +249,12 @@ static void cameraif_teardown(void) {
         esp_cam_ctlr_disable(c->cam);
         esp_cam_ctlr_del(c->cam);
         c->cam = NULL;
+    }
+    if (c->awb) {
+        esp_isp_awb_controller_stop_continuous_statistics(c->awb);
+        esp_isp_awb_controller_disable(c->awb);
+        esp_isp_del_awb_controller(c->awb);
+        c->awb = NULL;
     }
     if (c->isp) {
         esp_isp_disable(c->isp);
@@ -357,6 +373,106 @@ static bool cameraif_isp_input_for(int sensor_format, isp_color_t *out) {
 
 // --- constructor ---------------------------------------------------------
 
+// A raw sensor's colours need two corrections the ISP leaves off: a colour
+// matrix (the photosites' filters overlap, so its colour comes out pale and
+// green-leaning) and a gamma curve (it counts light linearly, so mid-tones look
+// dark). Both are per sensor; these are Espressif's tuning for the OV5647
+// (esp_cam_sensor's ov5647_default.json). Another sensor keeps an identity
+// matrix and the same gamma.
+static const float cameraif_ccm_identity[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+static const float cameraif_ccm_ov5647[9] = {
+    2.0f, -0.5459f, -0.4541f,
+    -0.4751f, 1.7696f, -0.2945f,
+    -0.2002f, -0.7998f, 2.0f,
+};
+#define CAMERAIF_GAMMA (0.72f)
+
+static uint32_t cameraif_gamma_curve(uint32_t x) {
+    return (uint32_t)(255.0f * powf((float)x / 255.0f, CAMERAIF_GAMMA) + 0.5f);
+}
+
+// The colour matrix with the white balance folded in: the gains scale the
+// sensor's red and blue before its matrix mixes them.
+static void cameraif_ccm_apply(cameraif_obj_t *c) {
+    const float *m = c->ccm ? c->ccm : cameraif_ccm_identity;
+    esp_isp_ccm_config_t cfg = { .saturation = true };
+    for (int r = 0; r < 3; r++) {
+        cfg.matrix[r][0] = m[r * 3 + 0] * c->gain_r;
+        cfg.matrix[r][1] = m[r * 3 + 1];
+        cfg.matrix[r][2] = m[r * 3 + 2] * c->gain_b;
+    }
+    if (esp_isp_ccm_configure(c->isp, &cfg) == ESP_OK) {
+        esp_isp_ccm_enable(c->isp);
+    }
+}
+
+static void cameraif_gamma_start(cameraif_obj_t *c) {
+    isp_gamma_curve_points_t pts;
+    if (esp_isp_gamma_fill_curve_points(cameraif_gamma_curve, &pts) != ESP_OK) {
+        return;
+    }
+    esp_isp_gamma_configure(c->isp, COLOR_COMPONENT_R, &pts);
+    esp_isp_gamma_configure(c->isp, COLOR_COMPONENT_G, &pts);
+    esp_isp_gamma_configure(c->isp, COLOR_COMPONENT_B, &pts);
+    esp_isp_gamma_enable(c->isp);
+}
+
+// ISR: keep the newest sums; the work happens in cameraif_awb_step().
+static bool cameraif_awb_done(isp_awb_ctlr_t awb, const esp_isp_awb_evt_data_t *edata, void *user) {
+    cameraif_obj_t *c = (cameraif_obj_t *)user;
+    c->awb_n = edata->awb_result.white_patch_num;
+    c->awb_r = edata->awb_result.sum_r;
+    c->awb_g = edata->awb_result.sum_g;
+    c->awb_b = edata->awb_result.sum_b;
+    c->awb_new = true;
+    return false;
+}
+
+// Grey world over the pixels that are neither dark nor clipped, a quarter of
+// the way per frame so a bright object crossing the picture doesn't flash it.
+// Too few such pixels (a dark room, a lens cap) and the gains stay put.
+static void cameraif_awb_step(cameraif_obj_t *c) {
+    if (!c->awb || !c->awb_on || !c->awb_new) {
+        return;
+    }
+    c->awb_new = false;
+    const uint32_t n = c->awb_n, r = c->awb_r, g = c->awb_g, b = c->awb_b;
+    if (n < 256 || r == 0 || g == 0 || b == 0) {
+        return;
+    }
+    float tr = (float)g / (float)r, tb = (float)g / (float)b;
+    tr = tr < 0.25f ? 0.25f : (tr > 3.9f ? 3.9f : tr);
+    tb = tb < 0.25f ? 0.25f : (tb > 3.9f ? 3.9f : tb);
+    c->gain_r += (tr - c->gain_r) * 0.25f;
+    c->gain_b += (tb - c->gain_b) * 0.25f;
+    cameraif_ccm_apply(c);
+}
+
+static void cameraif_awb_start(cameraif_obj_t *c) {
+    // A margin round the edge, where vignetting and clipped highlights live.
+    const uint32_t mx = c->width / 16, my = c->height / 16;
+    esp_isp_awb_config_t cfg = {
+        .sample_point = ISP_AWB_SAMPLE_POINT_BEFORE_CCM,
+        .window = { .top_left = { mx, my }, .btm_right = { c->width - 1 - mx, c->height - 1 - my } },
+        .subwindow = { .top_left = { mx, my }, .btm_right = { c->width - 1 - mx, c->height - 1 - my } },
+        .white_patch = {
+            .luminance = { .min = 60, .max = 660 },
+            .red_green_ratio = { .min = 0.2f, .max = 2.5f },
+            .blue_green_ratio = { .min = 0.2f, .max = 2.5f },
+        },
+    };
+    c->gain_r = c->gain_b = 1.0f;
+    cameraif_ccm_apply(c);
+    if (esp_isp_new_awb_controller(c->isp, &cfg, &c->awb) != ESP_OK) {
+        c->awb = NULL;
+        return;     // no AWB is a plainer picture, not a broken camera
+    }
+    esp_isp_awb_cbs_t cbs = { .on_statistics_done = cameraif_awb_done };
+    esp_isp_awb_register_event_callbacks(c->awb, &cbs, c);
+    esp_isp_awb_controller_enable(c->awb);
+    esp_isp_awb_controller_start_continuous_statistics(c->awb);
+}
+
 static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
     size_t n_kw, const mp_obj_t *all_args) {
     enum {
@@ -364,7 +480,7 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         ARG_reset, ARG_pwdn, ARG_xclk, ARG_xclk_hz,
         ARG_format, ARG_pixel_format, ARG_raw, ARG_lane_mbps,
         ARG_exposure, ARG_gain, ARG_flip, ARG_mirror, ARG_test_pattern,
-        ARG_bayer,
+        ARG_bayer, ARG_awb,
     };
     static const mp_arg_t allowed[] = {
         // Board wiring. sda/scl are required: a camera module cannot guess
@@ -400,6 +516,7 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         // The ISP's colour order ("BGGR", "GBRG", "GRBG", "RGGB"). Default:
         // the sensor's own, as flip= and mirror= leave it.
         { MP_QSTR_bayer,        MP_ARG_KW_ONLY | MP_ARG_OBJ,  {.u_obj = mp_const_none} },
+        { MP_QSTR_awb,          MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed),
@@ -692,6 +809,10 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
             mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("ISP init failed (%s, 0x%x)"), esp_err_to_name(err), (unsigned)err);
         }
         esp_isp_enable(c->isp);
+        c->awb_on = args[ARG_awb].u_bool;
+        c->ccm = c->sensor->id.pid == CAMERAIF_OV5647_PID ? cameraif_ccm_ov5647 : NULL;
+        cameraif_gamma_start(c);
+        cameraif_awb_start(c);
     }
 
     // esp_cam_ctlr_start() asks on_get_new_trans for the first buffer itself,
@@ -812,6 +933,7 @@ static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms,
         esp_cache_msync(c->frame, c->frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     }
     c->frames++;
+    cameraif_awb_step(c);
     return true;
 }
 
@@ -1399,6 +1521,35 @@ static mp_obj_t cameraif_bayer(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(cameraif_bayer_obj, cameraif_bayer);
 
+// awb(on=None) -> bool: automatic white balance. Off, the gains stay where
+// they were (wb_gains() sets them by hand).
+static mp_obj_t cameraif_awb(size_t n_args, const mp_obj_t *args) {
+    cameraif_obj_t *c = &cameraif_singleton;
+    if (n_args >= 2 && args[1] != mp_const_none) {
+        c->awb_on = mp_obj_is_true(args[1]);
+    }
+    return mp_obj_new_bool(c->awb_on && c->awb != NULL);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_awb_obj, 1, 2, cameraif_awb);
+
+// wb_gains(red=None, blue=None) -> (red, blue): the white balance's gains,
+// green being 1. Setting them turns awb() off, or it would undo them.
+static mp_obj_t cameraif_wb_gains(size_t n_args, const mp_obj_t *args) {
+    cameraif_obj_t *c = &cameraif_singleton;
+    if (n_args >= 3) {
+        if (!c->isp) {
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no ISP (raw camera)"));
+        }
+        c->awb_on = false;
+        c->gain_r = mp_obj_get_float(args[1]);
+        c->gain_b = mp_obj_get_float(args[2]);
+        cameraif_ccm_apply(c);
+    }
+    mp_obj_t items[2] = { mp_obj_new_float(c->gain_r), mp_obj_new_float(c->gain_b) };
+    return mp_obj_new_tuple(2, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_wb_gains_obj, 1, 3, cameraif_wb_gains);
+
 static const mp_rom_map_elem_t cameraif_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_capture), MP_ROM_PTR(&cameraif_capture_obj) },
     { MP_ROM_QSTR(MP_QSTR_capture_yuy2), MP_ROM_PTR(&cameraif_capture_yuy2_obj) },
@@ -1406,6 +1557,8 @@ static const mp_rom_map_elem_t cameraif_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_size), MP_ROM_PTR(&cameraif_size_obj) },
     { MP_ROM_QSTR(MP_QSTR_sensor), MP_ROM_PTR(&cameraif_sensor_obj) },
     { MP_ROM_QSTR(MP_QSTR_bayer), MP_ROM_PTR(&cameraif_bayer_obj) },
+    { MP_ROM_QSTR(MP_QSTR_awb), MP_ROM_PTR(&cameraif_awb_obj) },
+    { MP_ROM_QSTR(MP_QSTR_wb_gains), MP_ROM_PTR(&cameraif_wb_gains_obj) },
     { MP_ROM_QSTR(MP_QSTR_formats), MP_ROM_PTR(&cameraif_formats_obj) },
     { MP_ROM_QSTR(MP_QSTR_capture_scaled), MP_ROM_PTR(&cameraif_capture_scaled_obj) },
     { MP_ROM_QSTR(MP_QSTR_controls), MP_ROM_PTR(&cameraif_controls_obj) },

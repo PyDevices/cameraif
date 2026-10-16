@@ -187,11 +187,17 @@ static esp_err_t imx219_apply_orientation(esp_cam_sensor_device_t *dev) {
 }
 
 static esp_err_t imx219_get_sensor_id(esp_cam_sensor_device_t *dev, esp_cam_sensor_id_t *id) {
+    // Quiet on failure: probing finds nothing here on every board without an
+    // IMX219, and that isn't an error.
     uint8_t hi, lo;
-    ESP_RETURN_ON_ERROR(imx219_read(dev->sccb_handle, 0x0000, &hi), TAG, "read chip id");
-    ESP_RETURN_ON_ERROR(imx219_read(dev->sccb_handle, 0x0001, &lo), TAG, "read chip id");
-    id->pid = (uint16_t)(hi << 8 | lo);
-    return ESP_OK;
+    esp_err_t ret = imx219_read(dev->sccb_handle, 0x0000, &hi);
+    if (ret == ESP_OK) {
+        ret = imx219_read(dev->sccb_handle, 0x0001, &lo);
+    }
+    if (ret == ESP_OK) {
+        id->pid = (uint16_t)(hi << 8 | lo);
+    }
+    return ret;
 }
 
 static esp_err_t imx219_set_stream(esp_cam_sensor_device_t *dev, int enable) {

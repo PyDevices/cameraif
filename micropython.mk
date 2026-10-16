@@ -43,6 +43,8 @@ endif
 # The CSI controller, the ISP behind it and their HAL, the sensor drivers and
 # their SCCB layer: each builds a library, and the port links them.
 USER_ESP_IDF_COMPONENTS += esp_driver_cam esp_driver_isp esp_hal_cam esp_cam_sensor esp_sccb_intf
+# Sensor drivers of our own, for sensors esp_cam_sensor does not ship.
+SRC_USERMOD_C += $(CAMERAIF_MOD_DIR)/src/sensor_imx219.c
 
 # CircuitPython compiles modules outside ESP-IDF's CMake, so the components'
 # include directories are named here.

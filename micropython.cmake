@@ -14,6 +14,7 @@ add_library(usermod_cameraif INTERFACE)
 
 target_sources(usermod_cameraif INTERFACE
     ${CAMERAIF_SRC_DIR}/mod_cameraif.c
+    ${CAMERAIF_SRC_DIR}/sensor_imx219.c
 )
 
 target_include_directories(usermod_cameraif INTERFACE
@@ -50,6 +51,14 @@ endif()
 # The camera then reports "no sensor answered on SCCB" -- a wiring-shaped
 # error for a build-configuration cause. The sdkconfig options are what
 # matter; they live in the cameraif patch.
+
+# Our own sensor drivers (sensor_*.c, for sensors esp_cam_sensor doesn't
+# ship) are always compiled on the P4, so forcing them in is safe in a way the
+# note above says Espressif's are not. The -u pulls the driver's object out of
+# the archive; its probe entry is `used` and in a kept section from there.
+if(ESP_PLATFORM)
+    target_link_options(usermod_cameraif INTERFACE "-Wl,-u,imx219_detect")
+endif()
 
 target_link_libraries(usermod INTERFACE usermod_cameraif)
 

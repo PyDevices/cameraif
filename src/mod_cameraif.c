@@ -159,6 +159,7 @@ typedef struct {
     float gamma_off[3];         // the black each channel's curve takes off now
     const esp_cam_sensor_format_t *fmt; // the mode streaming, for the Bayer order after a flip
     bool bayer_fixed;           // bayer= was given: flips leave it alone
+    bool wbg;                   // white balance in the ISP's gain block (revision 3), not the matrix
     // Auto-exposure, for sensors with none of their own: the ISP measures
     // brightness after gamma, the ISR keeps the latest mean, and each frame
     // wait moves exposure, then gain, toward the target.
@@ -280,6 +281,10 @@ static void cameraif_teardown(void) {
         c->ae = NULL;
     }
     if (c->isp) {
+        if (c->wbg) {
+            esp_isp_wbg_disable(c->isp);    // its enable bit outlives the processor
+            c->wbg = false;
+        }
         esp_isp_disable(c->isp);
         esp_isp_del_processor(c->isp);
         c->isp = NULL;
@@ -440,7 +445,9 @@ static void cameraif_gamma_start(cameraif_obj_t *c);
 // sensor's red and blue before its matrix mixes them.
 static void cameraif_ccm_apply(cameraif_obj_t *c) {
     const float *m = c->ccm ? c->ccm : cameraif_ccm_identity;
-    esp_isp_ccm_config_t cfg = { .saturation = true };
+    // Applied at once: on revision 3 a change otherwise waits for the next
+    // frame start, and a second change before then is refused.
+    esp_isp_ccm_config_t cfg = { .saturation = true, .flags = { .update_once_configured = 1 } };
     // The hardware takes coefficients within +-4 before revision 3 (+-16
     // after), and refuses the whole matrix if one is outside: a measured
     // IMX219 matrix's 2.08 times a warm room's blue gain of 1.93 is 4.02,
@@ -450,8 +457,19 @@ static void cameraif_ccm_apply(cameraif_obj_t *c) {
     #else
     const float lim = 3.99f;
     #endif
+    // With the gain block, white balance happens there, ahead of the clip,
+    // and the matrix stays the sensor's own.
+    const float fr = c->wbg ? 1.0f : c->gain_r, fb = c->wbg ? 1.0f : c->gain_b;
+    if (c->wbg) {
+        isp_wbg_gain_t g = {
+            .gain_r = (uint32_t)(c->gain_r * 256.0f + 0.5f),
+            .gain_g = 256,
+            .gain_b = (uint32_t)(c->gain_b * 256.0f + 0.5f),
+        };
+        esp_isp_wbg_set_wb_gain(c->isp, g);
+    }
     for (int r = 0; r < 3; r++) {
-        float v[3] = { m[r * 3 + 0] * c->gain_r, m[r * 3 + 1], m[r * 3 + 2] * c->gain_b };
+        float v[3] = { m[r * 3 + 0] * fr, m[r * 3 + 1], m[r * 3 + 2] * fb };
         for (int k = 0; k < 3; k++) {
             cfg.matrix[r][k] = v[k] > lim ? lim : (v[k] < -lim ? -lim : v[k]);
         }
@@ -548,6 +566,11 @@ static void cameraif_awb_start(cameraif_obj_t *c) {
     };
     c->gain_r = c->gain_b = 1.0f;
     c->ccm_on = false;          // a new ISP processor starts with it off
+    c->wbg = false;
+    #if CONFIG_ESP32P4_REV_MIN_FULL >= 300
+    esp_isp_wbg_config_t wcfg = { .flags = { .update_once_configured = 1 } };
+    c->wbg = esp_isp_wbg_configure(c->isp, &wcfg) == ESP_OK && esp_isp_wbg_enable(c->isp) == ESP_OK;
+    #endif
     cameraif_ccm_apply(c);
     if (esp_isp_new_awb_controller(c->isp, &cfg, &c->awb) != ESP_OK) {
         c->awb = NULL;
@@ -1227,16 +1250,67 @@ static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms,
 // which releases the buffer back to the driver. Reading it after that is
 // reading a frame the sensor is overwriting -- so treat it as borrowed, and
 // copy anything you need to keep.
-static mp_obj_t cameraif_frame(size_t n_args, const mp_obj_t *args) {
+static mp_obj_t cameraif_frame(size_t n_args, const mp_obj_t *args, mp_map_t *kw) {
     cameraif_obj_t *c = MP_OBJ_TO_PTR(args[0]);
     mp_int_t timeout = (n_args > 1) ? mp_obj_get_int(args[1]) : 1000;
+    mp_map_elem_t *t = kw ? mp_map_lookup(kw, MP_OBJ_NEW_QSTR(MP_QSTR_timeout), MP_MAP_LOOKUP) : NULL;
+    if (t) {
+        timeout = mp_obj_get_int(t->value);
+    }
     if (!cameraif_wait_frame(c, timeout, true)) {
         return mp_const_none;
     }
     return mp_obj_new_memoryview('B' | MP_OBJ_ARRAY_TYPECODE_FLAG_RW,
         c->frame_bytes, c->frame);
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_frame_obj, 1, 2, cameraif_frame);
+static MP_DEFINE_CONST_FUN_OBJ_KW(cameraif_frame_obj, 1, cameraif_frame);
+
+// The documented keywords for a positional-only method: each name lands in
+// its slot, so capture(timeout=500) works as capture(None, 500) does.
+static mp_obj_t cameraif_call_kw(mp_obj_t (*fn)(size_t, const mp_obj_t *), const qstr *names,
+    const mp_obj_t *defaults, size_t n_names, size_t n_min, size_t n_args, const mp_obj_t *args,
+    mp_map_t *kw) {
+    mp_obj_t all[6];
+    size_t n = n_args;
+    if (n_args > 1 + n_names) {
+        mp_raise_TypeError(MP_ERROR_TEXT("too many arguments"));
+    }
+    for (size_t i = 0; i < n_args; i++) {
+        all[i] = args[i];
+    }
+    for (size_t i = n_args; i < 1 + n_names; i++) {
+        all[i] = MP_OBJ_NULL;
+    }
+    for (size_t k = 0; kw && k < kw->alloc; k++) {
+        if (!mp_map_slot_is_filled(kw, k)) {
+            continue;
+        }
+        qstr q = mp_obj_str_get_qstr(kw->table[k].key);
+        size_t i = 0;
+        while (i < n_names && names[i] != q) {
+            i++;
+        }
+        if (i == n_names) {
+            mp_raise_msg_varg(&mp_type_TypeError, MP_ERROR_TEXT("unexpected keyword argument '%q'"), q);
+        }
+        all[1 + i] = kw->table[k].value;
+        if (1 + i + 1 > n) {
+            n = 1 + i + 1;
+        }
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (all[i] == MP_OBJ_NULL) {
+            all[i] = defaults[i - 1];   // a skipped optional takes its documented default
+        }
+        if (all[i] == MP_OBJ_NULL) {
+            mp_raise_TypeError(MP_ERROR_TEXT("missing required arguments"));
+        }
+    }
+    if (n < n_min) {
+        mp_raise_TypeError(MP_ERROR_TEXT("missing required arguments"));
+    }
+    return fn(n, all);
+}
 
 // capture(buf=None, timeout=1000)
 //
@@ -1269,7 +1343,12 @@ static mp_obj_t cameraif_capture(size_t n_args, const mp_obj_t *args) {
     memcpy(buf.buf, c->frame, c->frame_bytes);
     return MP_OBJ_NEW_SMALL_INT((mp_int_t)c->frame_bytes);
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_obj, 1, 3, cameraif_capture);
+static mp_obj_t cameraif_capture_kw(size_t n_args, const mp_obj_t *args, mp_map_t *kw) {
+    static const qstr names[] = { MP_QSTR_buf, MP_QSTR_timeout };
+    static const mp_obj_t defaults[] = { mp_const_none, MP_OBJ_NEW_SMALL_INT(1000) };
+    return cameraif_call_kw(cameraif_capture, names, defaults, MP_ARRAY_SIZE(names), 1, n_args, args, kw);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(cameraif_capture_obj, 1, cameraif_capture_kw);
 
 // The PPA client capture_scaled and capture_yuy2 share; raises when the
 // firmware has no ppa module.
@@ -1346,8 +1425,12 @@ static mp_obj_t cameraif_capture_yuy2(size_t n_args, const mp_obj_t *args) {
     memcpy(buf.buf, c->yuy2_buf, need);
     return MP_OBJ_NEW_SMALL_INT((mp_int_t)need);
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_yuy2_obj, 4, 5,
-    cameraif_capture_yuy2);
+static mp_obj_t cameraif_capture_yuy2_kw(size_t n_args, const mp_obj_t *args, mp_map_t *kw) {
+    static const qstr names[] = { MP_QSTR_buf, MP_QSTR_width, MP_QSTR_height, MP_QSTR_timeout };
+    static const mp_obj_t defaults[] = { MP_OBJ_NULL, MP_OBJ_NULL, MP_OBJ_NULL, MP_OBJ_NEW_SMALL_INT(1000) };
+    return cameraif_call_kw(cameraif_capture_yuy2, names, defaults, MP_ARRAY_SIZE(names), 4, n_args, args, kw);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(cameraif_capture_yuy2_obj, 1, cameraif_capture_yuy2_kw);
 
 // capture_jpeg(quality=80, timeout=1000) -> bytes
 //
@@ -1389,8 +1472,12 @@ static mp_obj_t cameraif_capture_jpeg(size_t n_args, const mp_obj_t *args) {
     return jpegio_encode(c->frame, c->frame_bytes, c->width, c->height,
         (size_t)c->width * 2, 0, false, (int)quality, true, -1, false, NULL);
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_capture_jpeg_obj, 1, 3,
-    cameraif_capture_jpeg);
+static mp_obj_t cameraif_capture_jpeg_kw(size_t n_args, const mp_obj_t *args, mp_map_t *kw) {
+    static const qstr names[] = { MP_QSTR_quality, MP_QSTR_timeout };
+    static const mp_obj_t defaults[] = { MP_OBJ_NEW_SMALL_INT(80), MP_OBJ_NEW_SMALL_INT(1000) };
+    return cameraif_call_kw(cameraif_capture_jpeg, names, defaults, MP_ARRAY_SIZE(names), 1, n_args, args, kw);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(cameraif_capture_jpeg_obj, 1, cameraif_capture_jpeg_kw);
 
 // --- introspection and controls -----------------------------------------
 

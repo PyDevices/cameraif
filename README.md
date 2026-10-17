@@ -295,7 +295,7 @@ is there for when you do mean the sensor's own numbers.
 | `test_pattern(on=None)` | The sensor's internal pattern |
 | `auto_exposure(on=None, *, target=None)` | `(on, target, brightness)`: exposure, then gain, moved every frame toward `target` (0–255, after gamma). Setting `exposure()` or `gain()` turns it off |
 | `black_level(level=None)` | The black taken off each channel before gamma, allowing for white balance and the colour matrix |
-| `ccm(matrix=None)` | The colour matrix, nine numbers row by row; white balance scales its red and blue columns |
+| `ccm(matrix=None)` | The colour matrix, nine numbers row by row. On a P4 before revision 3 white balance scales its red and blue columns, so a highlight the sensor clips can take a tint; from revision 3 white balance runs in the ISP's own gain block, ahead of the clip |
 | `gamma(exponent=None)` | The tone curve's exponent; below 1 lifts the mid-tones |
 
 **Colour comes from the ISP, set up per sensor.** A raw sensor needs a colour

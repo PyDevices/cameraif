@@ -110,6 +110,7 @@ extern mp_obj_t jpegio_encode(const void *pixels, size_t len, int width, int hei
     int format, bool swap, int quality, bool subsample, int hardware, bool exact, bool *used_hw) __attribute__((weak));
 
 #define CAMERAIF_OV5647_PID (0x5647)
+#define CAMERAIF_IMX219_PID (0x0219)
 
 typedef struct {
     mp_obj_base_t base;
@@ -152,6 +153,18 @@ typedef struct {
     float gain_r, gain_b;
     bool ccm_on;                // enabled once; enabling again logs an error every frame
     const float *ccm;           // the sensor's colour matrix, row by row (identity if none is known)
+    float ccm_set[9];           // one set from Python, which ccm then points at
+    bool gamma_on;              // like ccm_on: enable once per ISP processor
+    float gamma_off[3];         // the black each channel's curve takes off now
+    // Auto-exposure, for sensors with none of their own: the ISP measures
+    // brightness after gamma, the ISR keeps the latest mean, and each frame
+    // wait moves exposure, then gain, toward the target.
+    isp_ae_ctlr_t ae;
+    bool ae_on;
+    volatile bool ae_new;
+    volatile uint32_t ae_luma;
+    uint8_t ae_target;
+    uint8_t ae_skip;            // frames left before the sensor shows the last change
 } cameraif_obj_t;
 
 // One camera, mirrored in BSS.
@@ -256,6 +269,12 @@ static void cameraif_teardown(void) {
         esp_isp_awb_controller_disable(c->awb);
         esp_isp_del_awb_controller(c->awb);
         c->awb = NULL;
+    }
+    if (c->ae) {
+        esp_isp_ae_controller_stop_continuous_statistics(c->ae);
+        esp_isp_ae_controller_disable(c->ae);
+        esp_isp_del_ae_controller(c->ae);
+        c->ae = NULL;
     }
     if (c->isp) {
         esp_isp_disable(c->isp);
@@ -386,36 +405,102 @@ static const float cameraif_ccm_ov5647[9] = {
     -0.4751f, 1.7696f, -0.2945f,
     -0.2002f, -0.7998f, 2.0f,
 };
-#define CAMERAIF_GAMMA (0.72f)
+// The IMX219's: Raspberry Pi's measured matrix for 3600 K light (libcamera's
+// imx219.json), blended 60:40 with identity. At full strength a highlight the
+// sensor clips turns magenta, because before revision 3 the white balance has
+// to ride in this matrix rather than in its own block ahead of the clip.
+static const float cameraif_ccm_imx219[9] = {
+    1.712f, -0.397f, -0.315f,
+    -0.467f, 2.017f, -0.550f,
+    -0.151f, -0.499f, 1.650f,
+};
+
+// The exponent, settable from Python per sensor.
+static float cameraif_gamma = 0.72f;
+#define CAMERAIF_GAMMA (cameraif_gamma)
+
+// The sensor's black level, in 8-bit steps: what a pixel reads with no light.
+// The gamma curve takes it off before lifting the mid-tones, so black is black
+// on every P4 revision (the ISP's own black-level block needs revision 3).
+static uint8_t cameraif_black;
+
+// Gamma comes after white balance and the colour matrix, which scale and mix
+// that black unevenly (a warm room's blue gain of 1.9 makes it 31 in blue, 16
+// in green), so a flat subtraction there leaves a tint in every dark and
+// mid-tone. Both steps are linear, so where black lands in each output channel
+// is known exactly, and each channel's curve takes off its own. This is the
+// offset of the channel being filled.
+static float cameraif_curve_off;
 
 static uint32_t cameraif_gamma_curve(uint32_t x) {
-    return (uint32_t)(255.0f * powf((float)x / 255.0f, CAMERAIF_GAMMA) + 0.5f);
+    const float off = cameraif_curve_off;
+    if ((float)x <= off) {
+        return 0;
+    }
+    float v = ((float)x - off) / (255.0f - off);
+    return (uint32_t)(255.0f * powf(v, CAMERAIF_GAMMA) + 0.5f);
 }
+
+static void cameraif_gamma_start(cameraif_obj_t *c);
 
 // The colour matrix with the white balance folded in: the gains scale the
 // sensor's red and blue before its matrix mixes them.
 static void cameraif_ccm_apply(cameraif_obj_t *c) {
     const float *m = c->ccm ? c->ccm : cameraif_ccm_identity;
     esp_isp_ccm_config_t cfg = { .saturation = true };
+    // The hardware takes coefficients within +-4 before revision 3 (+-16
+    // after), and refuses the whole matrix if one is outside: a measured
+    // IMX219 matrix's 2.08 times a warm room's blue gain of 1.93 is 4.02,
+    // and the picture silently kept its old colours. Clamp instead.
+    #if CONFIG_ESP32P4_REV_MIN_FULL >= 300
+    const float lim = 15.99f;
+    #else
+    const float lim = 3.99f;
+    #endif
     for (int r = 0; r < 3; r++) {
-        cfg.matrix[r][0] = m[r * 3 + 0] * c->gain_r;
-        cfg.matrix[r][1] = m[r * 3 + 1];
-        cfg.matrix[r][2] = m[r * 3 + 2] * c->gain_b;
+        float v[3] = { m[r * 3 + 0] * c->gain_r, m[r * 3 + 1], m[r * 3 + 2] * c->gain_b };
+        for (int k = 0; k < 3; k++) {
+            cfg.matrix[r][k] = v[k] > lim ? lim : (v[k] < -lim ? -lim : v[k]);
+        }
     }
-    if (esp_isp_ccm_configure(c->isp, &cfg) == ESP_OK && !c->ccm_on) {
+    esp_err_t err = esp_isp_ccm_configure(c->isp, &cfg);
+    if (err == ESP_OK && !c->ccm_on) {
         c->ccm_on = esp_isp_ccm_enable(c->isp) == ESP_OK;
+    }
+    // New gains move where black lands; follow it once it has moved a step.
+    if (cameraif_black && c->gamma_on) {
+        const float in[3] = { cameraif_black * c->gain_r, (float)cameraif_black, cameraif_black * c->gain_b };
+        for (int r = 0; r < 3; r++) {
+            float off = m[r * 3 + 0] * in[0] + m[r * 3 + 1] * in[1] + m[r * 3 + 2] * in[2];
+            if (fabsf(off - c->gamma_off[r]) >= 0.75f) {
+                cameraif_gamma_start(c);
+                break;
+            }
+        }
     }
 }
 
 static void cameraif_gamma_start(cameraif_obj_t *c) {
-    isp_gamma_curve_points_t pts;
-    if (esp_isp_gamma_fill_curve_points(cameraif_gamma_curve, &pts) != ESP_OK) {
-        return;
+    // Black after white balance, then through the matrix, per output channel.
+    static const float identity[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    const float *m = c->ccm ? c->ccm : identity;
+    const float b = (float)cameraif_black;
+    const float in[3] = { b * c->gain_r, b, b * c->gain_b };
+    static const color_component_t comp[3] = { COLOR_COMPONENT_R, COLOR_COMPONENT_G, COLOR_COMPONENT_B };
+    for (int r = 0; r < 3; r++) {
+        float off = m[r * 3 + 0] * in[0] + m[r * 3 + 1] * in[1] + m[r * 3 + 2] * in[2];
+        off = off < 0.0f ? 0.0f : (off > 128.0f ? 128.0f : off);
+        c->gamma_off[r] = off;
+        cameraif_curve_off = off;
+        isp_gamma_curve_points_t pts;
+        if (esp_isp_gamma_fill_curve_points(cameraif_gamma_curve, &pts) != ESP_OK) {
+            return;
+        }
+        esp_isp_gamma_configure(c->isp, comp[r], &pts);
     }
-    esp_isp_gamma_configure(c->isp, COLOR_COMPONENT_R, &pts);
-    esp_isp_gamma_configure(c->isp, COLOR_COMPONENT_G, &pts);
-    esp_isp_gamma_configure(c->isp, COLOR_COMPONENT_B, &pts);
-    esp_isp_gamma_enable(c->isp);
+    if (!c->gamma_on) {
+        c->gamma_on = esp_isp_gamma_enable(c->isp) == ESP_OK;
+    }
 }
 
 // ISR: keep the newest sums; the work happens in cameraif_awb_step().
@@ -437,7 +522,13 @@ static void cameraif_awb_step(cameraif_obj_t *c) {
         return;
     }
     c->awb_new = false;
-    const uint32_t n = c->awb_n, r = c->awb_r, g = c->awb_g, b = c->awb_b;
+    const uint32_t n = c->awb_n;
+    // The sums count the black floor too, which pulls every ratio toward
+    // grey; take it off first.
+    const uint32_t floor = n * cameraif_black;
+    const uint32_t r = c->awb_r > floor ? c->awb_r - floor : 0;
+    const uint32_t g = c->awb_g > floor ? c->awb_g - floor : 0;
+    const uint32_t b = c->awb_b > floor ? c->awb_b - floor : 0;
     if (n < 256 || r == 0 || g == 0 || b == 0) {
         return;
     }
@@ -475,6 +566,107 @@ static void cameraif_awb_start(cameraif_obj_t *c) {
     esp_isp_awb_controller_start_continuous_statistics(c->awb);
 }
 
+// ISR: the mean of the 5x5 block brightnesses.
+static bool IRAM_ATTR cameraif_ae_done(isp_ae_ctlr_t ae, const esp_isp_ae_env_detector_evt_data_t *edata, void *user) {
+    cameraif_obj_t *c = (cameraif_obj_t *)user;
+    uint32_t sum = 0;
+    for (int x = 0; x < ISP_AE_BLOCK_X_NUM; x++) {
+        for (int y = 0; y < ISP_AE_BLOCK_Y_NUM; y++) {
+            sum += edata->ae_result.luminance[x][y];
+        }
+    }
+    c->ae_luma = sum / (ISP_AE_BLOCK_X_NUM * ISP_AE_BLOCK_Y_NUM);
+    c->ae_new = true;
+    return false;
+}
+
+static int32_t cameraif_get_para(uint32_t id, int32_t fallback) {
+    cameraif_obj_t *c = &cameraif_singleton;
+    int32_t v = fallback;
+    if (!c->sensor || esp_cam_sensor_get_para_value(c->sensor, id, &v, sizeof(v)) != ESP_OK) {
+        return fallback;
+    }
+    return v;
+}
+
+// One step toward the target: exposure first when more light is wanted (it
+// adds no noise), gain first when less is. A dead band of about 8 percent,
+// and two frames' wait after each change, because the sensor applies a new
+// exposure a frame or two later and the statistics would otherwise chase it.
+static void cameraif_ae_step(cameraif_obj_t *c) {
+    if (!c->ae || !c->ae_on || !c->ae_new) {
+        return;
+    }
+    c->ae_new = false;
+    if (c->ae_skip) {
+        c->ae_skip--;
+        return;
+    }
+    const int32_t luma = c->ae_luma < 1 ? 1 : (int32_t)c->ae_luma;
+    const int32_t target = c->ae_target;
+    if (luma * 100 > target * 92 && luma * 100 < target * 108) {
+        return;
+    }
+    esp_cam_sensor_param_desc_t ed = { .id = ESP_CAM_SENSOR_EXPOSURE_VAL };
+    esp_cam_sensor_param_desc_t gd = { .id = ESP_CAM_SENSOR_ANGAIN };
+    bool have_e = esp_cam_sensor_query_para_desc(c->sensor, &ed) == ESP_OK;
+    bool have_g = esp_cam_sensor_query_para_desc(c->sensor, &gd) == ESP_OK;
+    if (!have_g) {
+        gd.id = ESP_CAM_SENSOR_GAIN;
+        have_g = esp_cam_sensor_query_para_desc(c->sensor, &gd) == ESP_OK;
+    }
+    int32_t e = have_e ? cameraif_get_para(ed.id, ed.number.maximum) : 0;
+    int32_t g = have_g ? cameraif_get_para(gd.id, gd.number.minimum) : 0;
+    // The ratio of light wanted, through the gamma curve, damped by half.
+    float ratio = powf((float)target / (float)luma, 1.0f / CAMERAIF_GAMMA);
+    ratio = 1.0f + (ratio - 1.0f) * 0.5f;
+    ratio = ratio < 0.25f ? 0.25f : (ratio > 4.0f ? 4.0f : ratio);
+    const int32_t gstep = have_g ? (gd.number.maximum - gd.number.minimum) / 24 + 1 : 0;
+    bool changed = false;
+    if (ratio > 1.0f) {
+        if (have_e && e < ed.number.maximum) {
+            int32_t ne = (int32_t)((float)e * ratio + 1.0f);
+            e = ne > ed.number.maximum ? ed.number.maximum : ne;
+            cameraif_set_para(ed.id, e);
+            changed = true;
+        } else if (have_g && g < gd.number.maximum) {
+            g = g + gstep > gd.number.maximum ? gd.number.maximum : g + gstep;
+            cameraif_set_para(gd.id, g);
+            changed = true;
+        }
+    } else {
+        if (have_g && g > gd.number.minimum) {
+            g = g - gstep < gd.number.minimum ? gd.number.minimum : g - gstep;
+            cameraif_set_para(gd.id, g);
+            changed = true;
+        } else if (have_e && e > ed.number.minimum) {
+            int32_t ne = (int32_t)((float)e * ratio);
+            e = ne < ed.number.minimum ? ed.number.minimum : ne;
+            cameraif_set_para(ed.id, e);
+            changed = true;
+        }
+    }
+    if (changed) {
+        c->ae_skip = 2;
+    }
+}
+
+static void cameraif_ae_start(cameraif_obj_t *c) {
+    const uint32_t mx = c->width / 16, my = c->height / 16;
+    esp_isp_ae_config_t cfg = {
+        .sample_point = ISP_AE_SAMPLE_POINT_AFTER_GAMMA,
+        .window = { .top_left = { mx, my }, .btm_right = { c->width - 1 - mx, c->height - 1 - my } },
+    };
+    if (esp_isp_new_ae_controller(c->isp, &cfg, &c->ae) != ESP_OK) {
+        c->ae = NULL;
+        return;
+    }
+    esp_isp_ae_env_detector_evt_cbs_t cbs = { .on_env_statistics_done = cameraif_ae_done };
+    esp_isp_ae_env_detector_register_event_callbacks(c->ae, &cbs, c);
+    esp_isp_ae_controller_enable(c->ae);
+    esp_isp_ae_controller_start_continuous_statistics(c->ae);
+}
+
 static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
     size_t n_kw, const mp_obj_t *all_args) {
     enum {
@@ -482,7 +674,7 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         ARG_reset, ARG_pwdn, ARG_xclk, ARG_xclk_hz,
         ARG_format, ARG_pixel_format, ARG_raw, ARG_lane_mbps,
         ARG_exposure, ARG_gain, ARG_flip, ARG_mirror, ARG_test_pattern,
-        ARG_bayer, ARG_awb,
+        ARG_bayer, ARG_awb, ARG_auto_exposure, ARG_black_level,
     };
     static const mp_arg_t allowed[] = {
         // Board wiring. sda/scl are required: a camera module cannot guess
@@ -519,6 +711,8 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         // the sensor's own, as flip= and mirror= leave it.
         { MP_QSTR_bayer,        MP_ARG_KW_ONLY | MP_ARG_OBJ,  {.u_obj = mp_const_none} },
         { MP_QSTR_awb,          MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
+        { MP_QSTR_auto_exposure, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
+        { MP_QSTR_black_level,  MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed),
@@ -656,7 +850,15 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sensor offers no formats"));
     }
     const esp_cam_sensor_format_t *chosen = &formats.format_array[0];
-    if (args[ARG_format].u_obj != mp_const_none) {
+    if (mp_obj_is_int(args[ARG_format].u_obj)) {
+        mp_int_t i = mp_obj_get_int(args[ARG_format].u_obj);
+        if (i < 0 || (uint32_t)i >= formats.count) {
+            cameraif_teardown();
+            mp_raise_msg_varg(&mp_type_ValueError,
+                MP_ERROR_TEXT("format index out of range (0-%d)"), (int)formats.count - 1);
+        }
+        chosen = &formats.format_array[i];
+    } else if (args[ARG_format].u_obj != mp_const_none) {
         const char *want = mp_obj_str_get_str(args[ARG_format].u_obj);
         const esp_cam_sensor_format_t *found = NULL;
         for (uint32_t i = 0; i < formats.count; i++) {
@@ -812,9 +1014,24 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         }
         esp_isp_enable(c->isp);
         c->awb_on = args[ARG_awb].u_bool;
-        c->ccm = c->sensor->id.pid == CAMERAIF_OV5647_PID ? cameraif_ccm_ov5647 : NULL;
+        const bool imx219 = c->sensor->id.pid == CAMERAIF_IMX219_PID;
+        c->ccm = c->sensor->id.pid == CAMERAIF_OV5647_PID ? cameraif_ccm_ov5647
+            : (imx219 ? cameraif_ccm_imx219 : NULL);
+        // The OV5647 takes its black level off and runs its own exposure on
+        // the sensor; an IMX219 does neither (black at 64 of 1023).
+        const bool own_ae = c->sensor->id.pid == CAMERAIF_OV5647_PID;
+        cameraif_black = args[ARG_black_level].u_obj != mp_const_none
+            ? (uint8_t)mp_obj_get_int(args[ARG_black_level].u_obj)
+            : (imx219 ? 12 : 0);   // 64 of 1023 at low gain, nearer 48 at the gain a room needs
+        c->ae_on = args[ARG_auto_exposure].u_obj != mp_const_none
+            ? mp_obj_is_true(args[ARG_auto_exposure].u_obj) : !own_ae;
+        c->ae_target = 110;
+        c->ae_skip = 0;
+        c->gamma_on = false;
+        cameraif_gamma = imx219 ? 0.5f : 0.72f;   // a new camera starts from its default, not the last one's
         cameraif_gamma_start(c);
         cameraif_awb_start(c);
+        cameraif_ae_start(c);
     }
 
     // esp_cam_ctlr_start() asks on_get_new_trans for the first buffer itself,
@@ -936,6 +1153,7 @@ static bool cameraif_wait_frame(cameraif_obj_t *c, mp_int_t timeout_ms,
     }
     c->frames++;
     cameraif_awb_step(c);
+    cameraif_ae_step(c);
     return true;
 }
 
@@ -1209,6 +1427,10 @@ static mp_obj_t cameraif_para(cameraif_obj_t *c, uint32_t id, size_t n_args,
         }
         if (esp_cam_sensor_set_para_value(c->sensor, id, &v, sizeof(v)) != ESP_OK) {
             mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sensor rejected value"));
+        }
+        if (id == ESP_CAM_SENSOR_EXPOSURE_VAL || id == ESP_CAM_SENSOR_GAIN
+            || id == ESP_CAM_SENSOR_ANGAIN) {
+            c->ae_on = false;   // or the next frame would undo it
         }
     }
 
@@ -1534,6 +1756,91 @@ static mp_obj_t cameraif_awb(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_awb_obj, 1, 2, cameraif_awb);
 
+// auto_exposure(on=None, *, target=None) -> (on, target, luma): exposure and
+// gain steered toward a brightness target (0-255, after gamma) every frame
+// you take. Setting exposure() or gain() by hand turns it off.
+static mp_obj_t cameraif_auto_exposure(size_t n_args, const mp_obj_t *args, mp_map_t *kw) {
+    cameraif_obj_t *c = &cameraif_singleton;
+    if (n_args >= 2 && args[1] != mp_const_none) {
+        c->ae_on = mp_obj_is_true(args[1]);
+    }
+    mp_map_elem_t *t = mp_map_lookup(kw, MP_OBJ_NEW_QSTR(MP_QSTR_target), MP_MAP_LOOKUP);
+    if (t && t->value != mp_const_none) {
+        int v = mp_obj_get_int(t->value);
+        c->ae_target = v < 8 ? 8 : (v > 247 ? 247 : v);
+    }
+    mp_obj_t r[3] = {
+        mp_obj_new_bool(c->ae_on && c->ae != NULL),
+        MP_OBJ_NEW_SMALL_INT(c->ae_target),
+        MP_OBJ_NEW_SMALL_INT(c->ae_luma),
+    };
+    return mp_obj_new_tuple(3, r);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(cameraif_auto_exposure_obj, 1, cameraif_auto_exposure);
+
+// ccm(matrix=None) -> tuple: the sensor's colour matrix, nine numbers row by
+// row (red out = m0*R + m1*G + m2*B, and so on). White balance scales its red
+// and blue columns on top. Each row should sum to about 1, or greys tint.
+static mp_obj_t cameraif_ccm(size_t n_args, const mp_obj_t *args) {
+    cameraif_obj_t *c = &cameraif_singleton;
+    if (n_args >= 2 && args[1] != mp_const_none) {
+        size_t n;
+        mp_obj_t *items;
+        mp_obj_get_array(args[1], &n, &items);
+        if (n != 9) {
+            mp_raise_ValueError(MP_ERROR_TEXT("ccm takes nine numbers, row by row"));
+        }
+        for (int i = 0; i < 9; i++) {
+            c->ccm_set[i] = mp_obj_get_float(items[i]);
+        }
+        c->ccm = c->ccm_set;
+        if (c->isp) {
+            cameraif_ccm_apply(c);
+        }
+    }
+    static const float identity[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    const float *m = c->ccm ? c->ccm : identity;
+    mp_obj_t r[9];
+    for (int i = 0; i < 9; i++) {
+        r[i] = mp_obj_new_float(m[i]);
+    }
+    return mp_obj_new_tuple(9, r);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_ccm_obj, 1, 2, cameraif_ccm);
+
+// gamma(exponent=None) -> float: the tone curve, out = in ** exponent after
+// the black level comes off. Below 1 lifts the mid-tones.
+static mp_obj_t cameraif_gamma_m(size_t n_args, const mp_obj_t *args) {
+    cameraif_obj_t *c = &cameraif_singleton;
+    if (n_args >= 2 && args[1] != mp_const_none) {
+        float g = mp_obj_get_float(args[1]);
+        if (g < 0.2f || g > 2.0f) {
+            mp_raise_ValueError(MP_ERROR_TEXT("gamma is between 0.2 and 2"));
+        }
+        cameraif_gamma = g;
+        if (c->isp) {
+            cameraif_gamma_start(c);
+        }
+    }
+    return mp_obj_new_float(cameraif_gamma);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_gamma_obj, 1, 2, cameraif_gamma_m);
+
+// black_level(level=None) -> int: what the sensor reads with no light, in
+// 8-bit steps, taken off before gamma.
+static mp_obj_t cameraif_black_level(size_t n_args, const mp_obj_t *args) {
+    cameraif_obj_t *c = &cameraif_singleton;
+    if (n_args >= 2 && args[1] != mp_const_none) {
+        int v = mp_obj_get_int(args[1]);
+        cameraif_black = v < 0 ? 0 : (v > 128 ? 128 : v);
+        if (c->isp) {
+            cameraif_gamma_start(c);
+        }
+    }
+    return MP_OBJ_NEW_SMALL_INT(cameraif_black);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(cameraif_black_level_obj, 1, 2, cameraif_black_level);
+
 // wb_gains(red=None, blue=None) -> (red, blue): the white balance's gains,
 // green being 1. Setting them turns awb() off, or it would undo them.
 static mp_obj_t cameraif_wb_gains(size_t n_args, const mp_obj_t *args) {
@@ -1561,6 +1868,10 @@ static const mp_rom_map_elem_t cameraif_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_bayer), MP_ROM_PTR(&cameraif_bayer_obj) },
     { MP_ROM_QSTR(MP_QSTR_awb), MP_ROM_PTR(&cameraif_awb_obj) },
     { MP_ROM_QSTR(MP_QSTR_wb_gains), MP_ROM_PTR(&cameraif_wb_gains_obj) },
+    { MP_ROM_QSTR(MP_QSTR_auto_exposure), MP_ROM_PTR(&cameraif_auto_exposure_obj) },
+    { MP_ROM_QSTR(MP_QSTR_black_level), MP_ROM_PTR(&cameraif_black_level_obj) },
+    { MP_ROM_QSTR(MP_QSTR_ccm), MP_ROM_PTR(&cameraif_ccm_obj) },
+    { MP_ROM_QSTR(MP_QSTR_gamma), MP_ROM_PTR(&cameraif_gamma_obj) },
     { MP_ROM_QSTR(MP_QSTR_formats), MP_ROM_PTR(&cameraif_formats_obj) },
     { MP_ROM_QSTR(MP_QSTR_capture_scaled), MP_ROM_PTR(&cameraif_capture_scaled_obj) },
     { MP_ROM_QSTR(MP_QSTR_controls), MP_ROM_PTR(&cameraif_controls_obj) },

@@ -48,6 +48,8 @@
 #include "esp_cam_ctlr_csi.h"
 #include "esp_cam_sensor.h"
 #include "esp_cam_sensor_detect.h"
+#include "sensor_table.h"
+#include "hal/isp_ll.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "esp_ldo_regulator.h"
@@ -110,7 +112,6 @@ extern mp_obj_t jpegio_encode(const void *pixels, size_t len, int width, int hei
     int format, bool swap, int quality, bool subsample, int hardware, bool exact, bool *used_hw) __attribute__((weak));
 
 #define CAMERAIF_OV5647_PID (0x5647)
-#define CAMERAIF_IMX219_PID (0x0219)
 
 typedef struct {
     mp_obj_base_t base;
@@ -156,6 +157,8 @@ typedef struct {
     float ccm_set[9];           // one set from Python, which ccm then points at
     bool gamma_on;              // like ccm_on: enable once per ISP processor
     float gamma_off[3];         // the black each channel's curve takes off now
+    const esp_cam_sensor_format_t *fmt; // the mode streaming, for the Bayer order after a flip
+    bool bayer_fixed;           // bayer= was given: flips leave it alone
     // Auto-exposure, for sensors with none of their own: the ISP measures
     // brightness after gamma, the ISR keeps the latest mean, and each frame
     // wait moves exposure, then gain, toward the target.
@@ -405,16 +408,6 @@ static const float cameraif_ccm_ov5647[9] = {
     -0.4751f, 1.7696f, -0.2945f,
     -0.2002f, -0.7998f, 2.0f,
 };
-// The IMX219's: Raspberry Pi's measured matrix for 3600 K light (libcamera's
-// imx219.json), blended 60:40 with identity. At full strength a highlight the
-// sensor clips turns magenta, because before revision 3 the white balance has
-// to ride in this matrix rather than in its own block ahead of the clip.
-static const float cameraif_ccm_imx219[9] = {
-    1.712f, -0.397f, -0.315f,
-    -0.467f, 2.017f, -0.550f,
-    -0.151f, -0.499f, 1.650f,
-};
-
 // The exponent, settable from Python per sensor.
 static float cameraif_gamma = 0.72f;
 #define CAMERAIF_GAMMA (cameraif_gamma)
@@ -674,7 +667,7 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         ARG_reset, ARG_pwdn, ARG_xclk, ARG_xclk_hz,
         ARG_format, ARG_pixel_format, ARG_raw, ARG_lane_mbps,
         ARG_exposure, ARG_gain, ARG_flip, ARG_mirror, ARG_test_pattern,
-        ARG_bayer, ARG_awb, ARG_auto_exposure, ARG_black_level,
+        ARG_bayer, ARG_awb, ARG_auto_exposure, ARG_black_level, ARG_sensor,
     };
     static const mp_arg_t allowed[] = {
         // Board wiring. sda/scl are required: a camera module cannot guess
@@ -713,6 +706,7 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         { MP_QSTR_awb,          MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
         { MP_QSTR_auto_exposure, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
         { MP_QSTR_black_level,  MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
+        { MP_QSTR_sensor,       MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed),
@@ -817,8 +811,44 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         .xclk_pin = args[ARG_xclk].u_int,
         .xclk_freq_hz = args[ARG_xclk_hz].u_int,
     };
+    // sensor= describes the camera in data (see sensor_table.c): open it at
+    // its own address and check its ID, instead of walking the drivers.
+    mp_obj_t table_desc = args[ARG_sensor].u_obj;
+    if (table_desc != mp_const_none) {
+        uint8_t addr = 0;
+        void *table = NULL;
+        nlr_buf_t nlr;
+        if (nlr_push(&nlr) == 0) {
+            table = cameraif_table_parse(table_desc, &addr);
+            nlr_pop();
+        } else {
+            cameraif_teardown();    // the bus and LDO are already ours
+            nlr_jump(nlr.ret_val);
+        }
+        sccb_i2c_config_t sccb_cfg = {
+            .scl_speed_hz = 100000,
+            .device_address = addr,
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        };
+        esp_sccb_io_handle_t io = NULL;
+        if (sccb_new_i2c_io(c->i2c, &sccb_cfg, &io) != ESP_OK) {
+            cameraif_table_free(table);
+            cameraif_teardown();
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("SCCB device init failed"));
+        }
+        sensor_cfg.sccb_handle = io;
+        sensor_cfg.sensor_port = ESP_CAM_SENSOR_MIPI_CSI;
+        c->sensor = cameraif_table_detect(table, &sensor_cfg);
+        if (c->sensor == NULL) {
+            esp_sccb_del_i2c_io(io);
+            cameraif_teardown();
+            mp_raise_msg(&mp_type_OSError,
+                MP_ERROR_TEXT("the described sensor did not answer with its ID"));
+        }
+        c->sccb = io;
+    }
     for (esp_cam_sensor_detect_fn_t *p = &__esp_cam_sensor_detect_fn_array_start;
-         p < &__esp_cam_sensor_detect_fn_array_end; ++p) {
+         c->sensor == NULL && p < &__esp_cam_sensor_detect_fn_array_end; ++p) {
         sccb_i2c_config_t sccb_cfg = {
             .scl_speed_hz = 100000,
             .device_address = p->sccb_addr,
@@ -918,6 +948,8 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
     c->height = chosen->height;
     c->bayer = cameraif_bayer_for(chosen, args[ARG_flip].u_bool, args[ARG_mirror].u_bool,
         c->sensor->id.pid == CAMERAIF_OV5647_PID);
+    c->fmt = chosen;
+    c->bayer_fixed = args[ARG_bayer].u_obj != mp_const_none;
     if (args[ARG_bayer].u_obj != mp_const_none) {
         const char *want = mp_obj_str_get_str(args[ARG_bayer].u_obj);
         int i = 0;
@@ -1014,21 +1046,49 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         }
         esp_isp_enable(c->isp);
         c->awb_on = args[ARG_awb].u_bool;
-        const bool imx219 = c->sensor->id.pid == CAMERAIF_IMX219_PID;
-        c->ccm = c->sensor->id.pid == CAMERAIF_OV5647_PID ? cameraif_ccm_ov5647
-            : (imx219 ? cameraif_ccm_imx219 : NULL);
+        c->ccm = c->sensor->id.pid == CAMERAIF_OV5647_PID ? cameraif_ccm_ov5647 : NULL;
+        // A described sensor brings its own tuning; the arguments win.
+        mp_obj_t tune_black = mp_const_none, tune_gamma = mp_const_none, tune_ae = mp_const_none;
+        if (table_desc != mp_const_none) {
+            mp_map_t *tm = mp_obj_dict_get_map(table_desc);
+            mp_map_elem_t *e;
+            if ((e = mp_map_lookup(tm, MP_OBJ_NEW_QSTR(MP_QSTR_black_level), MP_MAP_LOOKUP))) {
+                tune_black = e->value;
+            }
+            if ((e = mp_map_lookup(tm, MP_OBJ_NEW_QSTR(MP_QSTR_gamma), MP_MAP_LOOKUP))) {
+                tune_gamma = e->value;
+            }
+            if ((e = mp_map_lookup(tm, MP_OBJ_NEW_QSTR(MP_QSTR_auto_exposure), MP_MAP_LOOKUP))) {
+                tune_ae = e->value;
+            }
+            if ((e = mp_map_lookup(tm, MP_OBJ_NEW_QSTR(MP_QSTR_ccm), MP_MAP_LOOKUP)) && e->value != mp_const_none) {
+                size_t n;
+                mp_obj_t *items;
+                mp_obj_get_array(e->value, &n, &items);
+                if (n == 9) {
+                    for (int i = 0; i < 9; i++) {
+                        c->ccm_set[i] = mp_obj_get_float(items[i]);
+                    }
+                    c->ccm = c->ccm_set;
+                }
+            }
+        }
+        if (args[ARG_black_level].u_obj != mp_const_none) {
+            tune_black = args[ARG_black_level].u_obj;
+        }
+        if (args[ARG_auto_exposure].u_obj != mp_const_none) {
+            tune_ae = args[ARG_auto_exposure].u_obj;
+        }
         // The OV5647 takes its black level off and runs its own exposure on
-        // the sensor; an IMX219 does neither (black at 64 of 1023).
+        // the sensor; a raw sensor without either gets the loop here.
         const bool own_ae = c->sensor->id.pid == CAMERAIF_OV5647_PID;
-        cameraif_black = args[ARG_black_level].u_obj != mp_const_none
-            ? (uint8_t)mp_obj_get_int(args[ARG_black_level].u_obj)
-            : (imx219 ? 12 : 0);   // 64 of 1023 at low gain, nearer 48 at the gain a room needs
-        c->ae_on = args[ARG_auto_exposure].u_obj != mp_const_none
-            ? mp_obj_is_true(args[ARG_auto_exposure].u_obj) : !own_ae;
+        cameraif_black = tune_black != mp_const_none ? (uint8_t)mp_obj_get_int(tune_black) : 0;
+        c->ae_on = tune_ae != mp_const_none ? mp_obj_is_true(tune_ae) : !own_ae;
         c->ae_target = 110;
         c->ae_skip = 0;
         c->gamma_on = false;
-        cameraif_gamma = imx219 ? 0.5f : 0.72f;   // a new camera starts from its default, not the last one's
+        // A new camera starts from its own default, not the last one's.
+        cameraif_gamma = tune_gamma != mp_const_none ? mp_obj_get_float(tune_gamma) : 0.72f;
         cameraif_gamma_start(c);
         cameraif_awb_start(c);
         cameraif_ae_start(c);
@@ -1466,6 +1526,20 @@ static mp_obj_t cameraif_para_bool(cameraif_obj_t *c, uint32_t id,
         int32_t v = mp_obj_is_true(args[1]) ? 1 : 0;
         if (esp_cam_sensor_set_para_value(c->sensor, id, &v, sizeof(v)) != ESP_OK) {
             mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("sensor rejected value"));
+        }
+        // Flipping reads the array from the other end, so the colour order
+        // the ISP sees moves by a row or a column; follow it, or red and blue
+        // trade places.
+        if ((id == ESP_CAM_SENSOR_VFLIP || id == ESP_CAM_SENSOR_HMIRROR) && c->isp && c->fmt
+            && !c->bayer_fixed) {
+            int32_t fl = 0, mi = 0;
+            esp_cam_sensor_get_para_value(c->sensor, ESP_CAM_SENSOR_VFLIP, &fl, sizeof(fl));
+            esp_cam_sensor_get_para_value(c->sensor, ESP_CAM_SENSOR_HMIRROR, &mi, sizeof(mi));
+            int b = cameraif_bayer_for(c->fmt, fl != 0, mi != 0, c->sensor->id.pid == CAMERAIF_OV5647_PID);
+            if (b != c->bayer) {
+                c->bayer = b;
+                isp_ll_set_bayer_mode(&ISP, (color_raw_element_order_t)b);
+            }
         }
     }
     int32_t cur = 0;

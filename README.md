@@ -20,12 +20,15 @@ The sensor is found by probing, not by being told. `cameraif` asks the
 [`esp_cam_sensor`](https://components.espressif.com/components/espressif/esp_cam_sensor)
 component which of its drivers answers on the I2C bus you named, then reads
 resolution, frame rate, MIPI lane count and lane bit rate out of whatever
-driver replied. Adding a different camera is a build-time `CONFIG_CAMERA_*`
-away, not a code change here — which is why the class is `Camera` and not
-`OV5647`.
+driver replied — which is why the class is `Camera` and not `OV5647`.
 
-Proven on an ESP32-P4 with an OV5647 at 800x800. Every number in this
-document was measured on that board.
+A camera Espressif doesn't ship can be described in Python instead: its
+address, chip ID, register lists, modes and controls, and its colour tuning,
+as a dict passed as `sensor=`. No firmware build is needed for a new one; see
+[A camera described in Python](#a-camera-described-in-python).
+
+Proven on an ESP32-P4 with an OV5647 at 800x800 and an IMX219 (Raspberry Pi
+Camera v2) at up to 1920x1080.
 
 ## Why a C module
 
@@ -139,6 +142,9 @@ time — the P4 has one CSI controller — and constructing a second one raises.
 | `bayer` | `None` | The ISP's colour order (`"BGGR"`, `"GBRG"`, `"GRBG"`, `"RGGB"`); `None` works it out from the sensor and the orientation |
 | `awb` | `True` | Automatic white balance, from the ISP's own statistics |
 | `test_pattern` | `False` | Start with the sensor's internal pattern |
+| `sensor` | `None` | A sensor described in Python, used instead of probing ([below](#a-camera-described-in-python)) |
+| `auto_exposure` | `None` | Steer exposure and gain to a brightness target. `None`: on for sensors without exposure control of their own |
+| `black_level` | `None` | What the sensor reads with no light, in 8-bit steps, taken off before gamma |
 
 Board facts are arguments rather than build-time constants on purpose: the
 same firmware image should drive a camera on any board that has one, and a
@@ -287,6 +293,10 @@ is there for when you do mean the sensor's own numbers.
 | `awb(on=None)` | Automatic white balance. A bool |
 | `wb_gains(red=None, blue=None)` | The white balance's red and blue gains (green is 1). Setting them turns `awb` off |
 | `test_pattern(on=None)` | The sensor's internal pattern |
+| `auto_exposure(on=None, *, target=None)` | `(on, target, brightness)`: exposure, then gain, moved every frame toward `target` (0–255, after gamma). Setting `exposure()` or `gain()` turns it off |
+| `black_level(level=None)` | The black taken off each channel before gamma, allowing for white balance and the colour matrix |
+| `ccm(matrix=None)` | The colour matrix, nine numbers row by row; white balance scales its red and blue columns |
+| `gamma(exponent=None)` | The tone curve's exponent; below 1 lifts the mid-tones |
 
 **Colour comes from the ISP, set up per sensor.** A raw sensor needs a colour
 matrix (its filters overlap, so its colour is pale and green-leaning), a gamma
@@ -432,3 +442,36 @@ What's planned next is in [ROADMAP.md](ROADMAP.md).
 ## Licence
 
 MIT.
+
+## A camera described in Python
+
+A sensor that `esp_cam_sensor` doesn't ship needs no C. Describe it as a dict
+and pass it as `sensor=`; `cameraif` opens it at its address, checks its chip
+ID, and drives it from the description, just as it would one of Espressif's
+drivers. The IMX219 is described this way, in pydevices'
+[`drivers/camera/imx219.py`](https://github.com/PyDevices/pydevices/blob/main/drivers/camera/imx219.py):
+
+```python
+import cameraif
+from imx219 import SENSOR
+
+cam = cameraif.Camera(7, 8, i2c=1, reset=21, sensor=SENSOR)
+```
+
+| Key | Meaning |
+|---|---|
+| `name` | What `sensor()` reports |
+| `addr`, `reg_bits` | The SCCB address, and 8- or 16-bit register addresses |
+| `id` | `(register, value)`: the 16-bit chip ID, in that register and the next |
+| `init` | `[(register, value), ...]` written before every mode; `(None, ms)` waits |
+| `modes` | A list of dicts: `name`, `width`, `height`, `fps`, `format` (`"raw8"`, `"raw10"`, `"raw12"`), `bayer`, `lanes`, `lane_hz`, `pclk`, `hts`, `vts`, and the mode's `regs` |
+| `stream` | `(registers on, registers off)` |
+| `exposure`, `gain` | `(register, bytes, minimum, maximum, default)`; a maximum of `-n` is the mode's `vts` less `n`, a default of `None` the maximum |
+| `flip` | `(register, vertical bits, horizontal bits)` |
+| `test_pattern` | `(register, bytes, on value, off value)` |
+| `auto_exposure`, `black_level`, `gamma`, `ccm` | The camera's tuning; arguments to `Camera()` override it |
+
+Everything except `name`, `reg_bits`, the controls and the tuning is
+required, and a missing or malformed key raises a `ValueError` naming it.
+The description is copied when the camera opens, so changing the dict
+afterwards does nothing.

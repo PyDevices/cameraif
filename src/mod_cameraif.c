@@ -169,6 +169,7 @@ typedef struct {
     volatile uint32_t ae_luma;
     uint8_t ae_target;
     uint8_t ae_skip;            // frames left before the sensor shows the last change
+    int32_t ae_e, ae_g;         // what the loop last set, for drivers that can't read back (-1: nothing yet)
 } cameraif_obj_t;
 
 // One camera, mirrored in BSS.
@@ -631,8 +632,13 @@ static void cameraif_ae_step(cameraif_obj_t *c) {
         gd.id = ESP_CAM_SENSOR_GAIN;
         have_g = esp_cam_sensor_query_para_desc(c->sensor, &gd) == ESP_OK;
     }
-    int32_t e = have_e ? cameraif_get_para(ed.id, ed.number.maximum) : 0;
-    int32_t g = have_g ? cameraif_get_para(gd.id, gd.number.minimum) : 0;
+    // A driver that can't read a value back (the OV5647's) gets the one this
+    // loop last set, or the control's default to start from.
+    int32_t e = have_e ? cameraif_get_para(ed.id, c->ae_e >= 0 ? c->ae_e : ed.default_value) : 0;
+    int32_t g = have_g ? cameraif_get_para(gd.id, c->ae_g >= 0 ? c->ae_g : gd.default_value) : 0;
+    if (have_e && (e < ed.number.minimum || e > ed.number.maximum)) {
+        e = (ed.number.minimum + ed.number.maximum) / 2;
+    }
     // The ratio of light wanted, through the gamma curve, damped by half.
     float ratio = powf((float)target / (float)luma, 1.0f / CAMERAIF_GAMMA);
     ratio = 1.0f + (ratio - 1.0f) * 0.5f;
@@ -644,21 +650,25 @@ static void cameraif_ae_step(cameraif_obj_t *c) {
             int32_t ne = (int32_t)((float)e * ratio + 1.0f);
             e = ne > ed.number.maximum ? ed.number.maximum : ne;
             cameraif_set_para(ed.id, e);
+            c->ae_e = e;
             changed = true;
         } else if (have_g && g < gd.number.maximum) {
             g = g + gstep > gd.number.maximum ? gd.number.maximum : g + gstep;
             cameraif_set_para(gd.id, g);
+            c->ae_g = g;
             changed = true;
         }
     } else {
         if (have_g && g > gd.number.minimum) {
             g = g - gstep < gd.number.minimum ? gd.number.minimum : g - gstep;
             cameraif_set_para(gd.id, g);
+            c->ae_g = g;
             changed = true;
         } else if (have_e && e > ed.number.minimum) {
             int32_t ne = (int32_t)((float)e * ratio);
             e = ne < ed.number.minimum ? ed.number.minimum : ne;
             cameraif_set_para(ed.id, e);
+            c->ae_e = e;
             changed = true;
         }
     }
@@ -1102,11 +1112,13 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         if (args[ARG_auto_exposure].u_obj != mp_const_none) {
             tune_ae = args[ARG_auto_exposure].u_obj;
         }
-        // The OV5647 takes its black level off and runs its own exposure on
-        // the sensor; a raw sensor without either gets the loop here.
-        const bool own_ae = c->sensor->id.pid == CAMERAIF_OV5647_PID;
+        // On by default for every sensor. A raw sensor's exposure and gain are
+        // steered directly; on one that exposes itself (the OV5647) the loop
+        // steers its target, whose mode tables disagree by nearly two to one
+        // and none of which allows for the gamma curve lifting the picture.
         cameraif_black = tune_black != mp_const_none ? (uint8_t)mp_obj_get_int(tune_black) : 0;
-        c->ae_on = tune_ae != mp_const_none ? mp_obj_is_true(tune_ae) : !own_ae;
+        c->ae_on = tune_ae != mp_const_none ? mp_obj_is_true(tune_ae) : true;
+        c->ae_e = c->ae_g = -1;
         c->ae_target = 110;
         c->ae_skip = 0;
         c->gamma_on = false;
@@ -1152,19 +1164,22 @@ static mp_obj_t cameraif_make_new(const mp_obj_type_t *type, size_t n_args,
         }
     }
 
-    // Nothing in this pipeline does auto-exposure -- the P4's ISP has the
-    // hardware but no one drives it -- so a sensor at its defaults gives a
-    // recognisable but very dark picture. Fractions of each parameter's own
-    // advertised range, so they stay sane across sensors and formats.
+    // A starting exposure and gain, as fractions of each control's own range
+    // so they stay sane across sensors and modes; auto-exposure takes over
+    // from there. Not on a sensor that exposes itself: the OV5647's
+    // "exposure" is the target of its own loop, and 60 percent of that range
+    // aims it at 142 of 255 in raw terms, which gamma lifts to a picture a
+    // third clipped. Its driver's mode tables aim at about 84.
+    const bool self_exposing = c->sensor->id.pid == CAMERAIF_OV5647_PID;
     if (args[ARG_exposure].u_obj != mp_const_none) {
         cameraif_set_para(ESP_CAM_SENSOR_EXPOSURE_VAL,
             mp_obj_get_int(args[ARG_exposure].u_obj));
-    } else {
+    } else if (!self_exposing) {
         cameraif_set_para_fraction(ESP_CAM_SENSOR_EXPOSURE_VAL, 60);
     }
     if (args[ARG_gain].u_obj != mp_const_none) {
         cameraif_set_para(ESP_CAM_SENSOR_GAIN, mp_obj_get_int(args[ARG_gain].u_obj));
-    } else {
+    } else if (!self_exposing) {
         cameraif_set_para_fraction(ESP_CAM_SENSOR_GAIN, 25);
     }
     // Both, always: a mode table may leave either set (every OV5647 mode

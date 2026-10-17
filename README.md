@@ -143,7 +143,7 @@ time — the P4 has one CSI controller — and constructing a second one raises.
 | `awb` | `True` | Automatic white balance, from the ISP's own statistics |
 | `test_pattern` | `False` | Start with the sensor's internal pattern |
 | `sensor` | `None` | A sensor described in Python, used instead of probing ([below](#a-camera-described-in-python)) |
-| `auto_exposure` | `None` | Steer exposure and gain to a brightness target. `None`: on for sensors without exposure control of their own |
+| `auto_exposure` | `None` | Steer exposure and gain to a brightness target, measured after gamma. On unless `False`; on a sensor with its own auto-exposure (the OV5647) it steers that loop's target |
 | `black_level` | `None` | What the sensor reads with no light, in 8-bit steps, taken off before gamma |
 
 Board facts are arguments rather than build-time constants on purpose: the
